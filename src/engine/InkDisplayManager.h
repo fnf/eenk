@@ -52,6 +52,10 @@ public:
     void scrollToSelectedChoice();
 
     bool isChoicesVisible() const;
+    // True when any choice overlaps the viewport (stays true while paging
+    // through a long choice list). Unlike isChoicesVisible() which is only
+    // true at the very bottom (down-triangle indicator).
+    bool isAnyChoiceVisible() const;
     bool isChoicesRevealed() const { return _choicesRevealed; }
     void setChoicesRevealed(bool revealed) { _choicesRevealed = revealed; }
     void revealChoices();

@@ -528,6 +528,23 @@ bool InkDisplayManager::isChoicesVisible() const {
   return (_scrollY >= _maxScrollY - 2);
 }
 
+bool InkDisplayManager::isAnyChoiceVisible() const {
+  if (_numChoices == 0)
+    return true;
+  GfxRenderer *renderer = _display.getRenderer();
+  if (!renderer)
+    return true;
+  if (_maxScrollY <= 0)
+    return true;
+  // Choices live at the bottom of the document. Any choice overlaps the
+  // viewport once the viewport bottom scrolls past the start of the
+  // choices area, i.e. scrollY is within one choicesHeight of the bottom.
+  // Unlike isChoicesVisible() (at-bottom indicator for the down triangle),
+  // this stays true while paging through a long choice list.
+  int choicesHeight = getChoicesHeight();
+  return (_scrollY + choicesHeight + 2 >= _maxScrollY);
+}
+
 int InkDisplayManager::getChoiceIndexAtY(int touchY) const {
   if (_numChoices == 0 || !_choicesRevealed)
     return -1;

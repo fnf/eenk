@@ -119,7 +119,8 @@ void InkInputHandler::handleCommonNavigation(
   case ButtonEvent::LEFT:
   case ButtonEvent::UP: {
     if (choicesRevealed && display.getNumChoices() > 0 &&
-        display.getSelectedChoice() > 0) {
+        display.getSelectedChoice() > 0 &&
+        display.isAnyChoiceVisible()) {
       display.setSelectedChoice(display.getSelectedChoice() - 1);
       display.scrollToSelectedChoice();
       engine.requestRedraw();
@@ -139,7 +140,10 @@ void InkInputHandler::handleCommonNavigation(
       }
       engine.requestRedraw();
     } else if (display.getNumChoices() > 0) {
-      if (display.getSelectedChoice() < display.getNumChoices() - 1) {
+      if (!display.isAnyChoiceVisible()) {
+        handleScroll(display, scrollAmount);
+        engine.requestRedraw();
+      } else if (display.getSelectedChoice() < display.getNumChoices() - 1) {
         display.setSelectedChoice(display.getSelectedChoice() + 1);
         display.scrollToSelectedChoice();
         engine.requestRedraw();
@@ -160,7 +164,10 @@ void InkInputHandler::handleCommonNavigation(
       }
       engine.requestRedraw();
     } else if (display.getNumChoices() > 0) {
-      if (!isStoryEnded) {
+      if (!display.isAnyChoiceVisible()) {
+        handleScroll(display, scrollAmount);
+        engine.requestRedraw();
+      } else if (!isStoryEnded) {
         std::string choiceCpTitle;
         bool choiceHasCp = false;
         size_t chosenIdx = static_cast<size_t>(display.getSelectedChoice());
