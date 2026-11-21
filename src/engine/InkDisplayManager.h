@@ -11,6 +11,28 @@
 
 class InkStoryManager;
 
+// Shared scrollback limits (wrapped lines, ~27 chars/line at 448px width).
+// Single source of truth for InkEngine (turn-build trimming) and
+// InkDisplayManager/InkInputHandler (trim-on-scroll). Keep in sync.
+#if defined(BOARD_HAS_PSRAM)
+static constexpr size_t kHistoryTargetLines = 300;
+static constexpr size_t kHistoryHardMaxLines = 500;
+static constexpr size_t kHistoryAbsoluteMaxLines = 700;
+#elif defined(PLATFORM_NATIVE)
+static constexpr size_t kHistoryTargetLines = 800;
+static constexpr size_t kHistoryHardMaxLines = 1200;
+static constexpr size_t kHistoryAbsoluteMaxLines = 1600;
+#else
+// No-PSRAM (X4/C3): target 100 ≈ 5 screens at 39px line height.
+// Current turn is NEVER trimmed to target — it is preserved fully so the
+// user always sees its beginning; only scrolled-past lines are evicted
+// (trimScrolledAbove) as the user reads. Absolute max 300 is an OOM
+// failsafe for buggy stories (longest real LW turn ≈ 154 lines + combat).
+static constexpr size_t kHistoryTargetLines = 100;
+static constexpr size_t kHistoryHardMaxLines = 150;
+static constexpr size_t kHistoryAbsoluteMaxLines = 300;
+#endif
+
 struct WrappedLine {
     TextBlock block;
     bool isOld = false;
@@ -35,6 +57,10 @@ public:
     // Never touches current-turn lines — safe to call mid-turn while
     // new content is still being appended.
     void trimOldHistory(size_t targetLines);
+    // Evict fully-scrolled-past lines (above viewport) while over target.
+    // Called after scrolling down / revealing choices. Preserves unread
+    // content: only lines the user has scrolled past disappear.
+    void trimScrolledAbove();
     void addWrappedLine(const WrappedLine& line);
     void popOldestLine();
     size_t getHistorySize() const { return _wrappedLines.size(); }

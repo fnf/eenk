@@ -254,7 +254,7 @@ void InkDisplayManager::trimHistory(size_t targetLines, size_t hardMaxLines) {
   if (evictedCurrentTurn) {
     printf("[InkDisplayManager] WARNING: trimmed %u current-turn line(s) "
            "(history %u > hardMax %u). Beginning of this turn is lost. "
-           "Consider shortening the turn or raising kHardMaxHistoryLines.\n",
+           "Consider shortening the turn or raising kHistoryAbsoluteMaxLines.\n",
            (unsigned)phase2Evicted, (unsigned)(_wrappedLines.size() + phase2Evicted),
            (unsigned)hardMaxLines);
   }
@@ -265,6 +265,37 @@ void InkDisplayManager::trimOldHistory(size_t targetLines) {
   // Safe to call mid-turn while new content is still being appended.
   while (_wrappedLines.size() > targetLines && !_wrappedLines.empty() && _wrappedLines.front().isOld) {
     _wrappedLines.pop_front();
+  }
+}
+
+void InkDisplayManager::trimScrolledAbove() {
+  GfxRenderer *renderer = _display.getRenderer();
+  if (!renderer) {
+    return; // text-mode: no pixel viewport, nothing to judge "scrolled past"
+  }
+  // Evict only lines fully above the viewport (user has scrolled past them)
+  // while history exceeds the target. Viewport content stays visually
+  // stable: scrollY/maxScrollY shrink by exactly the removed height.
+  while (_wrappedLines.size() > kHistoryTargetLines && !_wrappedLines.empty()) {
+    int h = _wrappedLines.front().getHeight(renderer);
+    if (h <= 0) {
+      break; // avoid infinite loop on zero-height lines
+    }
+    if (h > _scrollY) {
+      break; // top line still (partially) visible — stop
+    }
+    _wrappedLines.pop_front();
+    _scrollY -= h;
+    _maxScrollY -= h;
+    if (_maxScrollY < 0) {
+      _maxScrollY = 0;
+    }
+    if (_scrollY < 0) {
+      _scrollY = 0;
+    }
+    if (_scrollY > _maxScrollY) {
+      _scrollY = _maxScrollY;
+    }
   }
 }
 
@@ -466,6 +497,9 @@ void InkDisplayManager::revealChoices() {
   _choicesRevealed = true;
   updateMaxScrollY();
   setScrollToBottom();
+  // User scrolled to the bottom to reveal choices — drop fully-scrolled-past
+  // lines if over target (long-turn overflow). See trimScrolledAbove().
+  trimScrolledAbove();
 }
 
 void InkDisplayManager::doAutoScroll(int newLinesCount, bool showChoices) {
@@ -535,6 +569,9 @@ void InkDisplayManager::scrollToSelectedChoice() {
   
   if (_scrollY < 0) _scrollY = 0;
   if (_scrollY > _maxScrollY) _scrollY = _maxScrollY;
+  // Choice navigation may scroll narrative off the top — reclaim it if over
+  // target. Only fully-hidden lines are evicted, so no visible jump.
+  trimScrolledAbove();
 }
 
 bool InkDisplayManager::isChoicesVisible() const {

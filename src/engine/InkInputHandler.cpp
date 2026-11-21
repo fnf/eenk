@@ -21,6 +21,11 @@ void InkInputHandler::handleScroll(InkDisplayManager &display,
   if (newScroll > display.getMaxScrollY())
     newScroll = display.getMaxScrollY();
   display.setScrollY(newScroll);
+  if (scrollAmount > 0) {
+    // Scrolling down past a long-turn overflow: reclaim fully-hidden lines
+    // above the viewport (user has read them). See trimScrolledAbove().
+    display.trimScrolledAbove();
+  }
 }
 
 void InkInputHandler::handleCommonNavigation(

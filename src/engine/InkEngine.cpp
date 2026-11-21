@@ -300,22 +300,24 @@ void InkEngine::tickRunningText() {
   int narrativeWidth = _display.getWidth() - (2 * marginX);
   int newLinesCount = 0;
 
-#if defined(BOARD_HAS_PSRAM)
-  static constexpr size_t kTargetHistoryLines = 300;
-  static constexpr size_t kHardMaxHistoryLines = 500;
-#elif defined(PLATFORM_NATIVE)
-  static constexpr size_t kTargetHistoryLines = 800;
-  static constexpr size_t kHardMaxHistoryLines = 1200;
-#else
-  // No-PSRAM (X4/C3): 100/150 wrapped lines ≈ 5-8 screens at 39px line
-  // height. Raised from 50/75 (Nov 21) so a single long turn (e.g. Lone
-  // Wolf section + combat log ≈ 60-70 lines) is never truncated, plus
-  // ~2-3 turns of scrollback. Pre-888c40a limit was 100 for all ESP32;
-  // streaming saves + font unload (888c40a) make 100+ safe again.
-  // Worst-case RAM ≈ 150 lines × ~200B × 2 (display + checkpoint copy).
-  static constexpr size_t kTargetHistoryLines = 100;
-  static constexpr size_t kHardMaxHistoryLines = 150;
-#endif
+  // Limits: kHistory* in InkDisplayManager.h is the shared source of truth.
+  // Target = scrollback goal; hard max = mid-turn old-eviction trigger;
+  // absolute max = OOM failsafe (may trim current turn with warning).
+  static constexpr size_t kTargetHistoryLines = kHistoryTargetLines;
+  static constexpr size_t kHardMaxHistoryLines = kHistoryHardMaxLines;
+  static constexpr size_t kAbsoluteMaxHistoryLines = kHistoryAbsoluteMaxLines;
+
+  auto trimMidTurn = [&]() {
+    // Evict ONLY old lines (never current turn) so the beginning stays
+    // intact while building. Absolute max is the OOM failsafe for buggy
+    // stories (realistic max ~184 lines << 300 no-PSRAM).
+    if (_displayManager.getHistorySize() > kHardMaxHistoryLines + 15) {
+      _displayManager.trimOldHistory(kTargetHistoryLines);
+    }
+    if (_displayManager.getHistorySize() > kAbsoluteMaxHistoryLines) {
+      _displayManager.trimHistory(kTargetHistoryLines, kAbsoluteMaxHistoryLines);
+    }
+  };
 
   auto pushLine = [&](const std::string &str) {
     if (str.empty()) {
@@ -337,13 +339,7 @@ void InkEngine::tickRunningText() {
       newLinesCount++;
     }
 
-    // Mid-turn: evict ONLY old (previous-turn) lines. Never touch the
-    // current turn while it is still being built — its beginning would
-    // otherwise be lost if the turn alone exceeds the hard max.
-    // The end-of-turn trimHistory() below remains the OOM failsafe.
-    if (_displayManager.getHistorySize() > kHardMaxHistoryLines + 15) {
-      _displayManager.trimOldHistory(kTargetHistoryLines);
-    }
+    trimMidTurn();
   };
 
   auto &runner = _storyManager.runner();
@@ -428,6 +424,7 @@ void InkEngine::tickRunningText() {
         wl.endOfParagraph = true;
         _displayManager.addWrappedLine(wl);
         newLinesCount++;
+        trimMidTurn();
       } else if (!s.empty()) {
         pushLine(s);
       }
@@ -438,7 +435,14 @@ void InkEngine::tickRunningText() {
     }
   }
 
-  _displayManager.trimHistory(kTargetHistoryLines, kHardMaxHistoryLines);
+  // End-of-turn: evict old lines only — current turn is preserved FULLY so
+  // doAutoScroll can show its beginning. Overflow shrinks via
+  // trimScrolledAbove() as the user scrolls down and reads. Absolute max
+  // remains as OOM failsafe for absurd turns (logs a warning).
+  _displayManager.trimOldHistory(kTargetHistoryLines);
+  if (_displayManager.getHistorySize() > kAbsoluteMaxHistoryLines) {
+    _displayManager.trimHistory(kTargetHistoryLines, kAbsoluteMaxHistoryLines);
+  }
 
   if (runner->has_choices()) {
     _displayManager.collectChoices(runner);
