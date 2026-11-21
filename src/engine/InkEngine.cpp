@@ -307,8 +307,14 @@ void InkEngine::tickRunningText() {
   static constexpr size_t kTargetHistoryLines = 800;
   static constexpr size_t kHardMaxHistoryLines = 1200;
 #else
-  static constexpr size_t kTargetHistoryLines = 50;
-  static constexpr size_t kHardMaxHistoryLines = 75;
+  // No-PSRAM (X4/C3): 100/150 wrapped lines ≈ 5-8 screens at 39px line
+  // height. Raised from 50/75 (Nov 21) so a single long turn (e.g. Lone
+  // Wolf section + combat log ≈ 60-70 lines) is never truncated, plus
+  // ~2-3 turns of scrollback. Pre-888c40a limit was 100 for all ESP32;
+  // streaming saves + font unload (888c40a) make 100+ safe again.
+  // Worst-case RAM ≈ 150 lines × ~200B × 2 (display + checkpoint copy).
+  static constexpr size_t kTargetHistoryLines = 100;
+  static constexpr size_t kHardMaxHistoryLines = 150;
 #endif
 
   auto pushLine = [&](const std::string &str) {
@@ -331,8 +337,12 @@ void InkEngine::tickRunningText() {
       newLinesCount++;
     }
 
+    // Mid-turn: evict ONLY old (previous-turn) lines. Never touch the
+    // current turn while it is still being built — its beginning would
+    // otherwise be lost if the turn alone exceeds the hard max.
+    // The end-of-turn trimHistory() below remains the OOM failsafe.
     if (_displayManager.getHistorySize() > kHardMaxHistoryLines + 15) {
-      _displayManager.trimHistory(kTargetHistoryLines, kHardMaxHistoryLines);
+      _displayManager.trimOldHistory(kTargetHistoryLines);
     }
   };
 

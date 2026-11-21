@@ -31,6 +31,10 @@ public:
 
     void clearHistory();
     void trimHistory(size_t targetLines, size_t hardMaxLines = 0);
+    // Evict only old (previous-turn) lines down to targetLines.
+    // Never touches current-turn lines — safe to call mid-turn while
+    // new content is still being appended.
+    void trimOldHistory(size_t targetLines);
     void addWrappedLine(const WrappedLine& line);
     void popOldestLine();
     size_t getHistorySize() const { return _wrappedLines.size(); }

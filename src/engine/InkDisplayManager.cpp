@@ -242,7 +242,28 @@ void InkDisplayManager::trimHistory(size_t targetLines, size_t hardMaxLines) {
 
   // Phase 2: Failsafe eviction if history still exceeds hardMaxLines
   // (e.g. if the current turn alone is excessively long, evict oldest lines to prevent OOM)
+  size_t phase2Evicted = 0;
+  bool evictedCurrentTurn = false;
   while (_wrappedLines.size() > hardMaxLines && !_wrappedLines.empty()) {
+    if (!_wrappedLines.front().isOld) {
+      evictedCurrentTurn = true;
+    }
+    _wrappedLines.pop_front();
+    phase2Evicted++;
+  }
+  if (evictedCurrentTurn) {
+    printf("[InkDisplayManager] WARNING: trimmed %u current-turn line(s) "
+           "(history %u > hardMax %u). Beginning of this turn is lost. "
+           "Consider shortening the turn or raising kHardMaxHistoryLines.\n",
+           (unsigned)phase2Evicted, (unsigned)(_wrappedLines.size() + phase2Evicted),
+           (unsigned)hardMaxLines);
+  }
+}
+
+void InkDisplayManager::trimOldHistory(size_t targetLines) {
+  // Phase 1 only: evict old (previous-turn) lines, never current-turn lines.
+  // Safe to call mid-turn while new content is still being appended.
+  while (_wrappedLines.size() > targetLines && !_wrappedLines.empty() && _wrappedLines.front().isOld) {
     _wrappedLines.pop_front();
   }
 }
