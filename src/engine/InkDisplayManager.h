@@ -81,10 +81,11 @@ public:
     void setScrollToBottom();
     void scrollToSelectedChoice();
 
+    // True when at bottom or all choices visible (hides down-triangle).
     bool isChoicesVisible() const;
     // True when any choice overlaps the viewport (stays true while paging
-    // through a long choice list). Unlike isChoicesVisible() which is only
-    // true at the very bottom (down-triangle indicator).
+    // through a long choice list). Unlike isChoicesVisible() which is also
+    // true when all choices fit with blank bottom (short lists).
     bool isAnyChoiceVisible() const;
     bool isChoicesRevealed() const { return _choicesRevealed; }
     void setChoicesRevealed(bool revealed) { _choicesRevealed = revealed; }
@@ -96,7 +97,16 @@ public:
     // Pages show whole narrative lines only (small blank instead of cut
     // lines). DOWN advances to the first line ending beyond the viewport
     // (zero rendered overlap); UP returns via history for exact round-trip.
+    // Strict-forward: last page shows choices at top with blank bottom
+    // (no bottom-pinning); short final to choices-top accepted.
     int getAvailableHeight() const;
+    int getNarrativeHeight() const;
+    // True when viewport reached narrative end (scrollY+avail >= N).
+    // Unrevealed DOWN reveals instead of paging to blank indicator page.
+    bool isNarrativeEndReached() const;
+    // True when all choices fully visible (short lists, blank bottom ok).
+    // Paging stops here (no extra turn); DOWN hands to nav.
+    bool isAllChoicesVisible() const;
     std::vector<int> getLineStartOffsets() const;
     int computeNextPageTop() const;
     int computePrevPageTop() const;

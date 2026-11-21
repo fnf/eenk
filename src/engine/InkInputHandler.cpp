@@ -96,7 +96,7 @@ void InkInputHandler::handleCommonNavigation(
   case ButtonEvent::UP: {
     if (choicesRevealed && display.getNumChoices() > 0 &&
         display.getSelectedChoice() > 0 &&
-        display.isAnyChoiceVisible()) {
+        (display.isAnyChoiceVisible() || display.isAllChoicesVisible())) {
       display.setSelectedChoice(display.getSelectedChoice() - 1);
       display.scrollToSelectedChoice();
       engine.requestRedraw();
@@ -112,7 +112,7 @@ void InkInputHandler::handleCommonNavigation(
       display.pageDown();
       engine.requestRedraw();
     } else if (display.getNumChoices() > 0) {
-      if (!display.isAnyChoiceVisible()) {
+      if (!display.isAnyChoiceVisible() && !display.isAllChoicesVisible()) {
         display.pageDown();
         engine.requestRedraw();
       } else if (display.getSelectedChoice() < display.getNumChoices() - 1) {
@@ -132,7 +132,7 @@ void InkInputHandler::handleCommonNavigation(
       display.pageDown();
       engine.requestRedraw();
     } else if (display.getNumChoices() > 0) {
-      if (!display.isAnyChoiceVisible()) {
+      if (!display.isAnyChoiceVisible() && !display.isAllChoicesVisible()) {
         display.pageDown();
         engine.requestRedraw();
       } else if (!isStoryEnded) {

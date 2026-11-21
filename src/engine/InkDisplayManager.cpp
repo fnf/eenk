@@ -309,6 +309,21 @@ int InkDisplayManager::getAvailableHeight() const {
   return avail > 0 ? avail : height;
 }
 
+int InkDisplayManager::getNarrativeHeight() const {
+  GfxRenderer *renderer = _display.getRenderer();
+  if (!renderer) {
+    return 0;
+  }
+  int total = 0;
+  for (const auto &w : _wrappedLines) {
+    int h = w.getHeight(renderer);
+    if (h > 0) {
+      total += h;
+    }
+  }
+  return total;
+}
+
 std::vector<int> InkDisplayManager::getLineStartOffsets() const {
   std::vector<int> offsets;
   offsets.reserve(_wrappedLines.size() + 1);
@@ -372,8 +387,27 @@ int InkDisplayManager::computeNextPageTop() const {
       return nextTop;
     }
   }
-  // Viewport bottom is beyond the narrative (in choices area): short final.
-  return _maxScrollY;
+  // Viewport bottom beyond narrative (in bottom area).
+  if (!_choicesRevealed) {
+    // Unrevealed: pageDown reveals on narrative-end-reached, so this is
+    // only the exact-edge case — go to bottom (clamped to max=N).
+    return _maxScrollY;
+  }
+  int narrativeEnd = offsets.empty() ? 0 : offsets.back();
+  if (_scrollY < narrativeEnd) {
+    // First choices page at narrative end (zero repeat, blank if short).
+    int nextTop = narrativeEnd;
+    if (nextTop > _maxScrollY) {
+      nextTop = _maxScrollY;
+    }
+    return nextTop;
+  }
+  // Already in tall choices: page through by avail (overlap avoids skip).
+  int raw = _scrollY + avail;
+  if (raw > _maxScrollY) {
+    raw = _maxScrollY;
+  }
+  return raw;
 }
 
 int InkDisplayManager::computePrevPageTop() const {
@@ -439,8 +473,16 @@ void InkDisplayManager::adjustPageHistory(int delta) {
 
 void InkDisplayManager::pageDown() {
   if (!_choicesRevealed) {
-    if (_scrollY >= _maxScrollY) {
+    // Reveal once viewport reaches narrative end (skips blank indicator
+    // page at N — goes directly to choices-top with zero repeat).
+    if (isNarrativeEndReached()) {
       revealChoices();
+      return;
+    }
+  } else {
+    // Short lists: stop when all visible (no extra turn to N).
+    // Tall lists: isAll never true, page through to bottom.
+    if (isAllChoicesVisible()) {
       return;
     }
   }
@@ -454,6 +496,12 @@ void InkDisplayManager::pageDown() {
   }
   if (next < 0) {
     next = 0;
+  }
+  // No progress (already at target): drop the pushed history.
+  if (next == _scrollY) {
+    int dummy = 0;
+    popPageHistory(dummy);
+    return;
   }
   _scrollY = next;
   trimScrolledAbove();
@@ -710,17 +758,15 @@ void InkDisplayManager::updateMaxScrollY() {
   if (!renderer)
     return;
 
-  int height = _display.getHeight();
-  int marginY = _settings.marginPx;
   int bottomExtraHeight = _choicesRevealed ? getChoicesHeight() : getIndicatorHeight();
-
-  int documentHeight = bottomExtraHeight;
-  for (const auto &w : _wrappedLines) {
-    documentHeight += w.getHeight(renderer);
-  }
-
-  int availableHeight = height - (2 * marginY);
-  _maxScrollY = std::max(0, documentHeight - availableHeight);
+  int narrativeEnd = getNarrativeHeight();
+  int documentHeight = narrativeEnd + bottomExtraHeight;
+  int availableHeight = getAvailableHeight();
+  int maxAbs = std::max(0, documentHeight - availableHeight);
+  // Strict-forward: allow blank bottom (final page at narrative end).
+  // Short bottom (<=avail) -> max=N (choices at top, blank below).
+  // Tall bottom (>avail) -> max=doc-avail (bottom-pinned, page through).
+  _maxScrollY = std::max(maxAbs, narrativeEnd);
   if (_scrollY > _maxScrollY) {
     _scrollY = _maxScrollY;
   }
@@ -731,48 +777,50 @@ void InkDisplayManager::revealChoices() {
     return;
   _choicesRevealed = true;
   updateMaxScrollY();
-  setScrollToBottom();
-  // User scrolled to the bottom to reveal choices — drop fully-scrolled-past
-  // lines if over target (long-turn overflow). See trimScrolledAbove().
+  GfxRenderer *renderer = _display.getRenderer();
+  if (!renderer) {
+    setScrollToBottom();
+    return;
+  }
+  // Strict-forward: go to choices-top (narrative end), not bottom.
+  // Short lists show choices at top with blank below (zero repeat);
+  // tall lists show first choices at top (page/nav through rest).
+  int narrativeEnd = getNarrativeHeight();
+  if (_scrollY != narrativeEnd) {
+    pushPageHistory(_scrollY);
+    _scrollY = narrativeEnd;
+    if (_scrollY < 0) {
+      _scrollY = 0;
+    }
+    if (_scrollY > _maxScrollY) {
+      _scrollY = _maxScrollY;
+    }
+  }
+  // User revealed choices — drop fully-scrolled-past lines if over target.
   trimScrolledAbove();
 }
 
 void InkDisplayManager::doAutoScroll(int newLinesCount, bool showChoices) {
+  (void)showChoices; // _choicesRevealed already matches (set before call).
   GfxRenderer *renderer = _display.getRenderer();
   if (!renderer)
     return;
 
-  int height = _display.getHeight();
-  int marginY = _settings.marginPx;
-  int bottomExtraHeight = showChoices ? getChoicesHeight() : getIndicatorHeight();
+  updateMaxScrollY();
 
-  int documentHeight = bottomExtraHeight;
-  for (const auto &w : _wrappedLines) {
-    documentHeight += w.getHeight(renderer);
-  }
-
-  int availableHeight = height - (2 * marginY);
-  _maxScrollY = std::max(0, documentHeight - availableHeight);
-
-  int newContentHeight = bottomExtraHeight;
+  // Strict-forward: new turn always starts at top (clean boundary).
+  // Short turns show blank bottom (no previous-tail); paging stays aligned.
   int startIndex = std::max(0, (int)_wrappedLines.size() - newLinesCount);
-  for (size_t i = startIndex; i < _wrappedLines.size(); ++i) {
-    const auto &w = _wrappedLines[i];
-    newContentHeight += w.getHeight(renderer);
+  int oldLinesHeight = 0;
+  for (int i = 0; i < startIndex; ++i) {
+    oldLinesHeight += _wrappedLines[i].getHeight(renderer);
   }
-
-  if (newContentHeight > availableHeight) {
-    // Scroll so the first new line is at the top of the visible narrative area
-    int oldLinesHeight = 0;
-    for (int i = 0; i < startIndex; ++i) {
-      const auto &w = _wrappedLines[i];
-      oldLinesHeight += w.getHeight(renderer);
-    }
-    _scrollY = std::min(_maxScrollY, oldLinesHeight);
-  } else {
-    // Snap to bottom
-    _scrollY = _maxScrollY;
+  _scrollY = std::min(_maxScrollY, oldLinesHeight);
+  if (_scrollY < 0) {
+    _scrollY = 0;
   }
+  // New turn starts fresh — previous paging history is stale.
+  clearPageHistory();
 }
 
 void InkDisplayManager::setScrollToBottom() { _scrollY = _maxScrollY; }
@@ -825,8 +873,11 @@ bool InkDisplayManager::isChoicesVisible() const {
   if (!renderer)
     return true;
 
-  // A choice is visible if the bottom of the scroll view reaches the choice
-  // area. Actually, choices are at the bottom of the document.
+  // Hide down-triangle when all visible (short, blank bottom ok) or at
+  // bottom (tall, paged through). Otherwise more below.
+  if (_choicesRevealed && isAllChoicesVisible()) {
+    return true;
+  }
   return (_scrollY >= _maxScrollY - 2);
 }
 
@@ -841,10 +892,37 @@ bool InkDisplayManager::isAnyChoiceVisible() const {
   // Choices live at the bottom of the document. Any choice overlaps the
   // viewport once the viewport bottom scrolls past the start of the
   // choices area, i.e. scrollY is within one choicesHeight of the bottom.
-  // Unlike isChoicesVisible() (at-bottom indicator for the down triangle),
-  // this stays true while paging through a long choice list.
+  // Unlike isChoicesVisible() (bottom or all-visible), this stays true
+  // while paging through a long choice list.
   int choicesHeight = getChoicesHeight();
   return (_scrollY + choicesHeight + 2 >= _maxScrollY);
+}
+
+bool InkDisplayManager::isNarrativeEndReached() const {
+  GfxRenderer *renderer = _display.getRenderer();
+  if (!renderer) {
+    return _scrollY >= _maxScrollY;
+  }
+  int avail = getAvailableHeight();
+  int narrativeEnd = getNarrativeHeight();
+  return (_scrollY + avail >= narrativeEnd);
+}
+
+bool InkDisplayManager::isAllChoicesVisible() const {
+  if (_numChoices == 0) {
+    return true;
+  }
+  GfxRenderer *renderer = _display.getRenderer();
+  if (!renderer) {
+    return true;
+  }
+  if (!_choicesRevealed) {
+    return false;
+  }
+  int avail = getAvailableHeight();
+  int narrativeEnd = getNarrativeHeight();
+  int docEnd = narrativeEnd + getChoicesHeight();
+  return (_scrollY <= narrativeEnd) && (_scrollY + avail >= docEnd);
 }
 
 int InkDisplayManager::getChoiceIndexAtY(int touchY) const {
