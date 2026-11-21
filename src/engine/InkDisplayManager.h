@@ -92,6 +92,23 @@ public:
     void updateMaxScrollY();
     int getIndicatorHeight() const;
 
+    // Stable full-page turns (whole lines, exact DOWN->UP return).
+    // Pages show whole narrative lines only (small blank instead of cut
+    // lines). DOWN advances to the first line ending beyond the viewport
+    // (zero rendered overlap); UP returns via history for exact round-trip.
+    int getAvailableHeight() const;
+    std::vector<int> getLineStartOffsets() const;
+    int computeNextPageTop() const;
+    int computePrevPageTop() const;
+    void pageDown();
+    void pageUp();
+    void pushPageHistory(int scrollY);
+    bool popPageHistory(int &out);
+    void clearPageHistory();
+    void adjustPageHistory(int delta);
+    int snapDownToLine(int rawTarget) const;
+    int snapUpToLine(int rawTarget) const;
+
     void redraw(InkStoryManager& storyManager, AppSettings& settings, int& refreshCount);
 
     struct ChoiceLayout {
@@ -132,6 +149,10 @@ private:
 
     int _scrollY = 0;
     int _maxScrollY = 0;
+    // Back-stack of page starts for exact UP return after short final steps.
+    // Adjusted by trimScrolledAbove (-H per evicted height); entries <=
+    // -availableHeight (entirely blank) are dropped.
+    std::vector<int> _pageHistory;
 
     bool _choicesRevealed = true;
 };

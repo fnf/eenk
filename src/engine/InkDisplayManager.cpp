@@ -1,4 +1,5 @@
 #include "InkDisplayManager.h"
+#include <algorithm>
 #include "InkRichTextParser.h"
 #include "InkStoryManager.h"
 #include "ui/ImageWidget.h"
@@ -229,7 +230,7 @@ void InkDisplayManager::resolveAndApplyFont(const StoryMetadata &meta,
   applyUserSetting();
 }
 
-void InkDisplayManager::clearHistory() { _wrappedLines.clear(); }
+void InkDisplayManager::clearHistory() { _wrappedLines.clear(); clearPageHistory(); }
 
 void InkDisplayManager::trimHistory(size_t targetLines, size_t hardMaxLines) {
   if (hardMaxLines == 0) {
@@ -287,6 +288,8 @@ void InkDisplayManager::trimScrolledAbove() {
     _wrappedLines.pop_front();
     _scrollY -= h;
     _maxScrollY -= h;
+    // Keep page-history pointing at the same content after eviction.
+    adjustPageHistory(-h);
     if (_maxScrollY < 0) {
       _maxScrollY = 0;
     }
@@ -297,6 +300,238 @@ void InkDisplayManager::trimScrolledAbove() {
       _scrollY = _maxScrollY;
     }
   }
+}
+
+int InkDisplayManager::getAvailableHeight() const {
+  int height = _display.getHeight();
+  int marginY = _settings.marginPx;
+  int avail = height - (2 * marginY);
+  return avail > 0 ? avail : height;
+}
+
+std::vector<int> InkDisplayManager::getLineStartOffsets() const {
+  std::vector<int> offsets;
+  offsets.reserve(_wrappedLines.size() + 1);
+  offsets.push_back(0);
+  GfxRenderer *renderer = _display.getRenderer();
+  if (!renderer) {
+    return offsets;
+  }
+  int acc = 0;
+  for (const auto &w : _wrappedLines) {
+    int h = w.getHeight(renderer);
+    if (h < 0) {
+      h = 0;
+    }
+    acc += h;
+    offsets.push_back(acc);
+  }
+  return offsets;
+}
+
+int InkDisplayManager::computeNextPageTop() const {
+  if (_maxScrollY <= 0) {
+    return 0;
+  }
+  if (_scrollY >= _maxScrollY) {
+    return _maxScrollY;
+  }
+  GfxRenderer *renderer = _display.getRenderer();
+  int avail = getAvailableHeight();
+  if (!renderer || avail <= 0) {
+    // Text-mode fallback: keep old 3/4-height step.
+    int height = _display.getHeight();
+    int step = height > 0 ? (height * 3 / 4) : 600;
+    int raw = _scrollY + step;
+    if (raw > _maxScrollY) {
+      raw = _maxScrollY;
+    }
+    return raw;
+  }
+  int viewportBottom = _scrollY + avail;
+  std::vector<int> offsets = getLineStartOffsets();
+  size_t n = _wrappedLines.size();
+  // First line ending beyond the viewport (cut line or first after).
+  // With whole-line rendering this gives zero rendered overlap and no loss:
+  // the cut line is skipped (blank) here and shown fully on the next page.
+  for (size_t i = 0; i < n; ++i) {
+    int lineBottom = (i + 1 < offsets.size()) ? offsets[i + 1] : offsets[i];
+    if (lineBottom > viewportBottom) {
+      int nextTop = offsets[i];
+      if (nextTop <= _scrollY) {
+        // Single line fills the viewport (tall image): pixel step to progress.
+        int raw = _scrollY + avail;
+        if (raw > _maxScrollY) {
+          raw = _maxScrollY;
+        }
+        return raw;
+      }
+      if (nextTop > _maxScrollY) {
+        return _maxScrollY;
+      }
+      return nextTop;
+    }
+  }
+  // Viewport bottom is beyond the narrative (in choices area): short final.
+  return _maxScrollY;
+}
+
+int InkDisplayManager::computePrevPageTop() const {
+  GfxRenderer *renderer = _display.getRenderer();
+  int avail = getAvailableHeight();
+  if (!renderer || avail <= 0) {
+    int height = _display.getHeight();
+    int step = height > 0 ? (height * 3 / 4) : 600;
+    int raw = _scrollY - step;
+    return raw < 0 ? 0 : raw;
+  }
+  int ideal = _scrollY - avail;
+  std::vector<int> offsets = getLineStartOffsets();
+  // Smallest line start strictly after the ideal keeps the previous page
+  // fully covering its lines (no loss) with 0-or-1 rendered overlap.
+  // UP via history (common case) is exact; this is only for empty history.
+  for (size_t i = 0; i < offsets.size(); ++i) {
+    if (offsets[i] > ideal) {
+      int prevTop = offsets[i];
+      if (prevTop >= _scrollY) {
+        return _scrollY;
+      }
+      return prevTop;
+    }
+  }
+  return 0;
+}
+
+void InkDisplayManager::pushPageHistory(int scrollY) {
+  if (_pageHistory.size() >= 32) {
+    _pageHistory.erase(_pageHistory.begin());
+  }
+  _pageHistory.push_back(scrollY);
+}
+
+bool InkDisplayManager::popPageHistory(int &out) {
+  if (_pageHistory.empty()) {
+    return false;
+  }
+  out = _pageHistory.back();
+  _pageHistory.pop_back();
+  return true;
+}
+
+void InkDisplayManager::clearPageHistory() {
+  _pageHistory.clear();
+}
+
+void InkDisplayManager::adjustPageHistory(int delta) {
+  if (delta == 0 || _pageHistory.empty()) {
+    return;
+  }
+  for (size_t i = 0; i < _pageHistory.size(); ++i) {
+    _pageHistory[i] += delta;
+  }
+  int avail = getAvailableHeight();
+  // Drop pages that would be entirely blank (fully above the start).
+  _pageHistory.erase(
+      std::remove_if(_pageHistory.begin(), _pageHistory.end(),
+                     [avail](int v) { return v <= -avail; }),
+      _pageHistory.end());
+}
+
+void InkDisplayManager::pageDown() {
+  if (!_choicesRevealed) {
+    if (_scrollY >= _maxScrollY) {
+      revealChoices();
+      return;
+    }
+  }
+  if (_scrollY >= _maxScrollY) {
+    return;
+  }
+  pushPageHistory(_scrollY);
+  int next = computeNextPageTop();
+  if (next > _maxScrollY) {
+    next = _maxScrollY;
+  }
+  if (next < 0) {
+    next = 0;
+  }
+  _scrollY = next;
+  trimScrolledAbove();
+}
+
+void InkDisplayManager::pageUp() {
+  int prev = 0;
+  if (popPageHistory(prev)) {
+    // Exact return to the previously visited page (preserves boundary even
+    // when the final DOWN was short). Allow one page of blank top when the
+    // previous start was trimmed away, as requested.
+    int avail = getAvailableHeight();
+    if (prev < -avail) {
+      prev = -avail;
+    }
+    if (prev > _maxScrollY) {
+      prev = _maxScrollY;
+    }
+    _scrollY = prev;
+    return;
+  }
+  int cur = _scrollY;
+  int computed = computePrevPageTop();
+  if (computed >= cur) {
+    return;
+  }
+  if (computed < 0) {
+    computed = 0;
+  }
+  if (computed > _maxScrollY) {
+    computed = _maxScrollY;
+  }
+  _scrollY = computed;
+}
+
+int InkDisplayManager::snapDownToLine(int rawTarget) const {
+  GfxRenderer *renderer = _display.getRenderer();
+  if (!renderer) {
+    return rawTarget;
+  }
+  std::vector<int> offsets = getLineStartOffsets();
+  if (offsets.empty()) {
+    return rawTarget;
+  }
+  int total = offsets.back();
+  if (rawTarget < 0 || rawTarget > total) {
+    return rawTarget;
+  }
+  for (size_t i = 0; i < offsets.size(); ++i) {
+    if (offsets[i] >= rawTarget) {
+      return offsets[i];
+    }
+  }
+  return rawTarget;
+}
+
+int InkDisplayManager::snapUpToLine(int rawTarget) const {
+  GfxRenderer *renderer = _display.getRenderer();
+  if (!renderer) {
+    return rawTarget;
+  }
+  std::vector<int> offsets = getLineStartOffsets();
+  if (offsets.empty()) {
+    return rawTarget;
+  }
+  int total = offsets.back();
+  if (rawTarget < 0 || rawTarget > total) {
+    return rawTarget;
+  }
+  int best = offsets[0];
+  for (size_t i = 0; i < offsets.size(); ++i) {
+    if (offsets[i] <= rawTarget) {
+      best = offsets[i];
+    } else {
+      break;
+    }
+  }
+  return best;
 }
 
 void InkDisplayManager::addWrappedLine(const WrappedLine &line) {
@@ -557,6 +792,7 @@ void InkDisplayManager::scrollToSelectedChoice() {
      docY += getChoiceBlockHeight(l, lines) + l.choicePadding;
   }
   
+  int oldScrollY = _scrollY;
   if (docY < l.marginY) {
      _scrollY += docY - l.marginY;
   } else {
@@ -566,7 +802,15 @@ void InkDisplayManager::scrollToSelectedChoice() {
         _scrollY += (docY + currentChoiceHeight) - (_display.getHeight() - l.marginY);
      }
   }
-  
+  // Stay line-aligned: snap further in the scroll direction so the choice
+  // moves away from the viewport edge (still fully visible) and paging
+  // boundaries stay stable. Narrative-only; choices area keeps pixels.
+  if (_scrollY > oldScrollY) {
+    _scrollY = snapDownToLine(_scrollY);
+  } else if (_scrollY < oldScrollY) {
+    _scrollY = snapUpToLine(_scrollY);
+  }
+
   if (_scrollY < 0) _scrollY = 0;
   if (_scrollY > _maxScrollY) _scrollY = _maxScrollY;
   // Choice navigation may scroll narrative off the top — reclaim it if over
@@ -685,7 +929,16 @@ void InkDisplayManager::redraw(InkStoryManager &storyManager,
   for (const auto &w : _wrappedLines) {
     int itemHeight = w.getHeight(renderer);
     if (!w.block.isEmpty() || w.isImage) {
-      if ((y + itemHeight > 0) && (y < height)) {
+      bool lineVisible;
+      if (w.isImage) {
+        // Images may exceed the viewport: keep partial rendering.
+        lineVisible = (y + itemHeight > 0) && (y < height);
+      } else {
+        // Whole lines only: skip partial top/bottom (small blank instead of
+        // cut text). Paging advances to the skipped cut line, so no loss.
+        lineVisible = (y >= 0) && (y + itemHeight <= height);
+      }
+      if (lineVisible) {
         if (w.isImage) {
           InkStoryManager::ImageMeta meta;
           if (storyManager.getImageMeta(w.imagePath.c_str(), meta) &&

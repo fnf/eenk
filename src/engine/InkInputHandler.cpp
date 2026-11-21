@@ -13,21 +13,6 @@ InkInputHandler::InkInputHandler(IInput &input) : _input(input) {}
 
 InkInputHandler::~InkInputHandler() {}
 
-void InkInputHandler::handleScroll(InkDisplayManager &display,
-                                   int scrollAmount) {
-  int newScroll = display.getScrollY() + scrollAmount;
-  if (newScroll < 0)
-    newScroll = 0;
-  if (newScroll > display.getMaxScrollY())
-    newScroll = display.getMaxScrollY();
-  display.setScrollY(newScroll);
-  if (scrollAmount > 0) {
-    // Scrolling down past a long-turn overflow: reclaim fully-hidden lines
-    // above the viewport (user has read them). See trimScrolledAbove().
-    display.trimScrolledAbove();
-  }
-}
-
 void InkInputHandler::handleCommonNavigation(
     bool isStoryEnded, InkEngine &engine, InkDisplayManager &display,
     InkStoryManager &story, class IDisplay &IDisplay,
@@ -43,8 +28,6 @@ void InkInputHandler::handleCommonNavigation(
 
   _input.resetActivityTimer();
 
-  int scrollAmount = IDisplay.getHeight() * 3 / 4;
-
   bool choicesRevealed = display.isChoicesRevealed();
 
   if (hasTouchTap) {
@@ -59,21 +42,17 @@ void InkInputHandler::handleCommonNavigation(
 
     if (settings.touchScrollEnabled && ev != ButtonEvent::CONFIRM) {
       if (touchY < IDisplay.getHeight() / 3 && display.getScrollY() > 0) {
-        handleScroll(display, -scrollAmount);
+        display.pageUp();
         engine.requestRedraw();
         return;
       } else {
         if (!choicesRevealed) {
-          if (display.getScrollY() >= display.getMaxScrollY()) {
-            display.revealChoices();
-          } else {
-            handleScroll(display, scrollAmount);
-          }
+          display.pageDown();
           engine.requestRedraw();
           return;
         } else if (touchY > IDisplay.getHeight() * 2 / 3 &&
                    !display.isChoicesVisible()) {
-          handleScroll(display, scrollAmount);
+          display.pageDown();
           engine.requestRedraw();
           return;
         }
@@ -102,19 +81,11 @@ void InkInputHandler::handleCommonNavigation(
 
   if (settings.touchScrollEnabled) {
     if (ev == ButtonEvent::SWIPE_DOWN) {
-      handleScroll(display, -scrollAmount);
+      display.pageUp();
       engine.requestRedraw();
       return;
     } else if (ev == ButtonEvent::SWIPE_UP) {
-      if (!choicesRevealed) {
-        if (display.getScrollY() >= display.getMaxScrollY()) {
-          display.revealChoices();
-        } else {
-          handleScroll(display, scrollAmount);
-        }
-      } else {
-        handleScroll(display, scrollAmount);
-      }
+      display.pageDown();
       engine.requestRedraw();
       return;
     }
@@ -130,7 +101,7 @@ void InkInputHandler::handleCommonNavigation(
       display.scrollToSelectedChoice();
       engine.requestRedraw();
     } else {
-      handleScroll(display, -scrollAmount);
+      display.pageUp();
       engine.requestRedraw();
     }
     break;
@@ -138,15 +109,11 @@ void InkInputHandler::handleCommonNavigation(
   case ButtonEvent::RIGHT:
   case ButtonEvent::DOWN: {
     if (!choicesRevealed) {
-      if (display.getScrollY() >= display.getMaxScrollY()) {
-        display.revealChoices();
-      } else {
-        handleScroll(display, scrollAmount);
-      }
+      display.pageDown();
       engine.requestRedraw();
     } else if (display.getNumChoices() > 0) {
       if (!display.isAnyChoiceVisible()) {
-        handleScroll(display, scrollAmount);
+        display.pageDown();
         engine.requestRedraw();
       } else if (display.getSelectedChoice() < display.getNumChoices() - 1) {
         display.setSelectedChoice(display.getSelectedChoice() + 1);
@@ -162,15 +129,11 @@ void InkInputHandler::handleCommonNavigation(
   }
   case ButtonEvent::CONFIRM: {
     if (!choicesRevealed) {
-      if (display.getScrollY() >= display.getMaxScrollY()) {
-        display.revealChoices();
-      } else {
-        handleScroll(display, scrollAmount);
-      }
+      display.pageDown();
       engine.requestRedraw();
     } else if (display.getNumChoices() > 0) {
       if (!display.isAnyChoiceVisible()) {
-        handleScroll(display, scrollAmount);
+        display.pageDown();
         engine.requestRedraw();
       } else if (!isStoryEnded) {
         std::string choiceCpTitle;
