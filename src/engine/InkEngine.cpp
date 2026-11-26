@@ -213,6 +213,7 @@ bool InkEngine::choose(size_t index) {
       }
     }
   }
+  saveUndoPoint();
   _displayManager.markHistoryOld();
   _storyManager.runner()->choose(index);
   if (choiceHasCp) {
@@ -220,6 +221,32 @@ bool InkEngine::choose(size_t index) {
   }
   _state = State::RUNNING_TEXT;
   return true;
+}
+
+void InkEngine::saveUndoPoint() {
+  if (!_storyManager.runner()) {
+    return;
+  }
+  // Free cached glyphs first: streamSnapshotTo needs small transient buffers
+  // (~10-15KB for large gamebooks) and the glyph cache fragments the heap.
+  _displayManager.clearFontCache();
+
+  size_t snapLen = _storyManager.computeSnapshotSize();
+  if (snapLen == 0 || snapLen > StorySaveManager::kMaxUndoSnapLen) {
+    return;
+  }
+
+  _saveManager.saveUndoStreaming(
+      snapLen, _displayManager.getHistory(),
+      [this](IFileWriter &w) -> size_t {
+        return _storyManager.streamSnapshotTo(w);
+      });
+
+  if (!_saveManager.writeUndoFile(_storage)) {
+    // Non-fatal by design: the choice still goes through, only the undo
+    // slot stays empty (or keeps its previous content).
+    printf("[InkEngine] Undo snapshot write failed (non-fatal)\n");
+  }
 }
 
 void InkEngine::triggerCheckpoint(const std::string &checkpointTitle) {

@@ -155,6 +155,10 @@ void InkInputHandler::handleCommonNavigation(
 
         display.flashChoiceActivation(story, settings,
                                       display.getSelectedChoice());
+        // Universal pre-choice snapshot: must precede markHistoryOld() so the
+        // undo slot holds the history exactly as displayed at decision time.
+        // Non-fatal — the choice below always goes through.
+        engine.saveUndoPoint();
         display.markHistoryOld();
         if (story.runner()) {
           ink::g_ink_has_jmp_buf = true;
@@ -199,13 +203,18 @@ void InkInputHandler::showStoryMenu(
   SystemUI ui(IDisplay);
   StorySaveManager &saveMgr = engine.getSaveManager();
 
-  enum Action { EXIT_TO_MENU, REWIND_CHECKPOINT, REWIND_NAMED, RESTART_STORY };
+  enum Action { EXIT_TO_MENU, UNDO_CHOICE, REWIND_CHECKPOINT, REWIND_NAMED, RESTART_STORY };
 
   std::vector<std::string> menuOptions;
   std::vector<Action> optionActions;
 
   menuOptions.push_back("Save and exit");
   optionActions.push_back(EXIT_TO_MENU);
+
+  if (saveMgr.hasUndo()) {
+    menuOptions.push_back("Undo last choice");
+    optionActions.push_back(UNDO_CHOICE);
+  }
 
   if (saveMgr.hasUnnamedCheckpoint()) {
     menuOptions.push_back("Rewind to last checkpoint");
@@ -255,6 +264,21 @@ void InkInputHandler::showStoryMenu(
     }
     engine.setShouldSleep(false);
     engine.setState(InkEngine::State::DONE);
+    break;
+  }
+  case UNDO_CHOICE: {
+    if (ui.showConfirmDialog(_input, "Confirm Undo",
+                             "Are you sure you want to undo the last "
+                             "choice?\n\nCurrent "
+                             "progress will be lost.",
+                             "", menuW, menuH, false)) {
+      if (saveMgr.restoreUndo(story, display, &engine.getStorage())) {
+        // Persist the checkpoint-list truncation (abandoned future).
+        saveMgr.writeSaveFile(engine.getStorage());
+        engine.incrementRefreshCount();
+        engine.setState(InkEngine::State::RUNNING_TEXT);
+      }
+    }
     break;
   }
   case REWIND_CHECKPOINT: {

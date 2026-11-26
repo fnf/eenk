@@ -135,6 +135,14 @@ Sirens echoed in the distance as the hovercraft engine roared to life...
 - Rewinding to a chapter will remove access to subsequent ones: it's a linear chain and you snip it when you rewind.
 - There is no visual clue that a chapter has been reached, it is left to you whether or not to reveal it (for example with an explicit `Act I`, or a subtler in-game message).
 
+### Undo last choice (automatic, no tags needed)
+
+Independently of checkpoints, eenk automatically snapshots the story **before every choice** the player confirms. The Story Menu therefore always offers **`Undo last choice`** (after the first choice), which returns to the previous decision point — including from death endings, with no authoring required.
+
+- Single level: undoing consumes the slot; the next confirmed choice re-arms it.
+- The snapshot survives save-and-exit and reboot (stored next to the save file).
+- Design implication: you no longer need defensive `# CHECKPOINT`s before every risky branch — reserve them for meaningful milestones. Undo covers the "oops, wrong corridor" case universally.
+
 ## Building with eenky
 
 eenky compiles your `.ink` files into a `.eenk` package file optimized for the eenk hardware. It uses a customized compiler pipeline (`inklecate` -> `inkcpp_cl` -> `eenkPackage`).

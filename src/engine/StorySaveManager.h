@@ -38,6 +38,9 @@ class StorySaveManager {
 public:
   static constexpr uint32_t MAGIC_ENK1 = 0x314B4E45; // "ENK1"
   static constexpr uint32_t MAGIC_ENK2 = 0x324B4E45; // "ENK2"
+  static constexpr uint32_t MAGIC_ENKU = 0x554B4E45; // "ENKU" (undo slot)
+  // Sanity cap for undo snapshots (largest real story ~15KB; 4MB = corrupt).
+  static constexpr size_t kMaxUndoSnapLen = 4u * 1024u * 1024u;
 
   StorySaveManager();
   ~StorySaveManager();
@@ -90,6 +93,22 @@ public:
                          InkDisplayManager &display,
                          IStorage *storage = nullptr);
 
+  // Undo slot: single pre-choice snapshot, persisted to a dedicated sidecar
+  // file (<save>.undo) on every choice confirm. Written synchronously (~20KB,
+  // ~15-30ms on SD — invisible behind e-ink refresh); held on disk, zero RAM
+  // when idle. Never blocks gameplay: all failures are non-fatal.
+  void saveUndoStreaming(size_t snapLen,
+                          const std::deque<WrappedLine> &history,
+                          SnapshotStreamFn streamFn);
+  bool writeUndoFile(IStorage &storage);
+  bool hasUndo() const { return _hasUndo; }
+  const std::string &getUndoFilePath() const { return _undoFilePath; }
+  // Restores the pre-choice state, truncates checkpoints saved after the undo
+  // point (abandoned future), and consumes the slot (deletes the file).
+  bool restoreUndo(InkStoryManager &story, InkDisplayManager &display,
+                   IStorage *storage = nullptr);
+  void clearUndo(IStorage *storage = nullptr);
+
   // Restart / wipe
   void clearAll(IStorage &storage);
 
@@ -117,6 +136,10 @@ public:
 private:
   bool writeSaveData(class IFileWriter &writer, class IFileReader *oldReader,
                      std::vector<size_t> *outNewOffsets = nullptr);
+  // Validates undo sidecar header (magic + story hash + sane length) and sets
+  // _hasUndo. Deletes stale/corrupt files. Header-only: no snapshot bytes
+  // are loaded into RAM.
+  void probeUndoFile(IStorage &storage);
 
   std::string _saveFilePath;
   uint32_t _storyHash = 0;
@@ -130,4 +153,13 @@ private:
   std::vector<uint8_t> _mainHistorySerialized;
 
   std::vector<CheckpointEntry> _checkpoints;
+
+  // Undo slot state (disk-backed; no snapshot bytes held in RAM when idle)
+  std::string _undoFilePath;
+  bool _hasUndo = false;
+  // Pending-write state (transient between saveUndoStreaming/writeUndoFile)
+  size_t _undoSnapLen = 0;
+  size_t _undoCpCount = 0;
+  SnapshotStreamFn _undoStreamFn = nullptr;
+  std::deque<WrappedLine> _undoHistory;
 };

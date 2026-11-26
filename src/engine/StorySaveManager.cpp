@@ -16,6 +16,12 @@ void StorySaveManager::init(const std::string &saveFilePath,
   _mainSnapshot.clear();
   _mainHistory.clear();
   _checkpoints.clear();
+  _undoFilePath = saveFilePath.empty() ? "" : saveFilePath + ".undo";
+  _hasUndo = false;
+  _undoSnapLen = 0;
+  _undoCpCount = 0;
+  _undoStreamFn = nullptr;
+  _undoHistory.clear();
 }
 
 bool StorySaveManager::serializeHistory(const std::deque<WrappedLine> &history,
@@ -185,6 +191,9 @@ bool StorySaveManager::deserializeHistory(IFileReader &reader,
 bool StorySaveManager::loadSaveFile(IStorage &storage,
                                     InkStoryManager *storyMgr) {
   if (_saveFilePath.empty() || !storage.fileExists(_saveFilePath.c_str())) {
+    // No main save (fresh story): the undo slot is still probed so a
+    // surviving sidecar from the same story version stays usable.
+    probeUndoFile(storage);
     return false;
   }
 
@@ -193,7 +202,7 @@ bool StorySaveManager::loadSaveFile(IStorage &storage,
   _mainHistory.clear();
   _checkpoints.clear();
 
-  return storage.readStream(
+  bool result = storage.readStream(
       _saveFilePath.c_str(), [&](IFileReader &reader) -> bool {
         size_t fileSize = reader.size();
         if (fileSize < 8)
@@ -309,6 +318,8 @@ bool StorySaveManager::loadSaveFile(IStorage &storage,
 
         return false;
       });
+  probeUndoFile(storage);
+  return result;
 }
 
 bool StorySaveManager::writeSaveData(IFileWriter &writer,
@@ -833,5 +844,247 @@ void StorySaveManager::clearAll(IStorage &storage) {
   _checkpoints.clear();
   if (!_saveFilePath.empty() && storage.fileExists(_saveFilePath.c_str())) {
     storage.deleteFile(_saveFilePath.c_str());
+  }
+  clearUndo(&storage);
+}
+
+void StorySaveManager::saveUndoStreaming(
+    size_t snapLen, const std::deque<WrappedLine> &history,
+    SnapshotStreamFn streamFn) {
+  if (snapLen == 0 || snapLen > kMaxUndoSnapLen || !streamFn ||
+      _undoFilePath.empty()) {
+    return;
+  }
+  _undoSnapLen = snapLen;
+  // Checkpoint count at undo time: entries appended later belong to the
+  // abandoned future and are truncated on restore.
+  _undoCpCount = _checkpoints.size() > 0xFFFF ? 0xFFFF : _checkpoints.size();
+  _undoStreamFn = std::move(streamFn);
+  _undoHistory = history;
+}
+
+bool StorySaveManager::writeUndoFile(IStorage &storage) {
+  bool ok = false;
+  if (!_undoFilePath.empty() && _undoSnapLen > 0 &&
+      _undoSnapLen <= kMaxUndoSnapLen && _undoStreamFn) {
+    std::string tmpPath = _undoFilePath + ".tmp";
+    size_t snapLen = _undoSnapLen;
+    uint16_t cpCount = static_cast<uint16_t>(_undoCpCount);
+    uint32_t storyHash = _storyHash;
+    ok = storage.writeStream(
+        tmpPath.c_str(), [&](IFileWriter &writer) -> bool {
+          uint8_t hdr[16];
+          hdr[0] = static_cast<uint8_t>(MAGIC_ENKU & 0xFF);
+          hdr[1] = static_cast<uint8_t>((MAGIC_ENKU >> 8) & 0xFF);
+          hdr[2] = static_cast<uint8_t>((MAGIC_ENKU >> 16) & 0xFF);
+          hdr[3] = static_cast<uint8_t>((MAGIC_ENKU >> 24) & 0xFF);
+          hdr[4] = static_cast<uint8_t>(storyHash & 0xFF);
+          hdr[5] = static_cast<uint8_t>((storyHash >> 8) & 0xFF);
+          hdr[6] = static_cast<uint8_t>((storyHash >> 16) & 0xFF);
+          hdr[7] = static_cast<uint8_t>((storyHash >> 24) & 0xFF);
+          hdr[8] = static_cast<uint8_t>(snapLen & 0xFF);
+          hdr[9] = static_cast<uint8_t>((snapLen >> 8) & 0xFF);
+          hdr[10] = static_cast<uint8_t>((snapLen >> 16) & 0xFF);
+          hdr[11] = static_cast<uint8_t>((snapLen >> 24) & 0xFF);
+          hdr[12] = static_cast<uint8_t>(cpCount & 0xFF);
+          hdr[13] = static_cast<uint8_t>((cpCount >> 8) & 0xFF);
+          hdr[14] = 0; // reserved
+          hdr[15] = 0; // reserved
+          if (!writer.write(hdr, sizeof(hdr)))
+            return false;
+          if (_undoStreamFn(writer) != snapLen)
+            return false;
+          return serializeHistory(_undoHistory, writer);
+        });
+    if (ok) {
+      storage.deleteFile(_undoFilePath.c_str());
+      ok = storage.renameFile(tmpPath.c_str(), _undoFilePath.c_str());
+      if (!ok) {
+        storage.deleteFile(tmpPath.c_str());
+      }
+    } else {
+      storage.deleteFile(tmpPath.c_str());
+    }
+  }
+  // Single-shot pending state is always cleared. On failure the previous
+  // sidecar (if any) is left untouched, so _hasUndo keeps its old value.
+  _undoStreamFn = nullptr;
+  _undoSnapLen = 0;
+  _undoCpCount = 0;
+  _undoHistory.clear();
+  if (ok) {
+    _hasUndo = true;
+  }
+  return ok;
+}
+
+void StorySaveManager::probeUndoFile(IStorage &storage) {
+  _hasUndo = false;
+  if (_undoFilePath.empty()) {
+    return;
+  }
+  // Drop an orphaned tmp file from an interrupted write (power loss
+  // mid-choice). The previous sidecar is only replaced by rename after a
+  // complete write, so at most one stale tmp can exist.
+  std::string tmpPath = _undoFilePath + ".tmp";
+  if (storage.fileExists(tmpPath.c_str())) {
+    storage.deleteFile(tmpPath.c_str());
+  }
+  if (!storage.fileExists(_undoFilePath.c_str())) {
+    return;
+  }
+  bool valid = false;
+  storage.readStream(_undoFilePath.c_str(), [&](IFileReader &reader) -> bool {
+    uint8_t hdr[12];
+    if (reader.read(hdr, sizeof(hdr)) != sizeof(hdr)) {
+      return false;
+    }
+    uint32_t magic = static_cast<uint32_t>(hdr[0]) |
+                     (static_cast<uint32_t>(hdr[1]) << 8) |
+                     (static_cast<uint32_t>(hdr[2]) << 16) |
+                     (static_cast<uint32_t>(hdr[3]) << 24);
+    uint32_t hash = static_cast<uint32_t>(hdr[4]) |
+                    (static_cast<uint32_t>(hdr[5]) << 8) |
+                    (static_cast<uint32_t>(hdr[6]) << 16) |
+                    (static_cast<uint32_t>(hdr[7]) << 24);
+    uint32_t snapLen = static_cast<uint32_t>(hdr[8]) |
+                       (static_cast<uint32_t>(hdr[9]) << 8) |
+                       (static_cast<uint32_t>(hdr[10]) << 16) |
+                       (static_cast<uint32_t>(hdr[11]) << 24);
+    if (magic != MAGIC_ENKU) {
+      return false;
+    }
+    if (_storyHash != 0 && hash != _storyHash) {
+      return false;
+    }
+    if (snapLen == 0 || snapLen > kMaxUndoSnapLen) {
+      return false;
+    }
+    valid = true;
+    return true;
+  });
+  if (valid) {
+    _hasUndo = true;
+  } else {
+    // Stale (story updated) or corrupt: drop so it can never shadow a fresh
+    // slot or confuse the menu.
+    storage.deleteFile(_undoFilePath.c_str());
+  }
+}
+
+bool StorySaveManager::restoreUndo(InkStoryManager &story,
+                                   InkDisplayManager &display,
+                                   IStorage *storage) {
+  if (!_hasUndo || _undoFilePath.empty() || storage == nullptr) {
+    return false;
+  }
+  if (!storage->fileExists(_undoFilePath.c_str())) {
+    _hasUndo = false;
+    return false;
+  }
+
+  uint16_t cpCount = 0;
+  std::deque<WrappedLine> history;
+  bool headerValid = false;
+  bool loaded = false;
+  uint32_t wantHash = _storyHash;
+  bool ok = storage->readStream(
+      _undoFilePath.c_str(), [&](IFileReader &reader) -> bool {
+        uint8_t hdr[16];
+        if (reader.read(hdr, sizeof(hdr)) != sizeof(hdr)) {
+          return false;
+        }
+        uint32_t magic = static_cast<uint32_t>(hdr[0]) |
+                         (static_cast<uint32_t>(hdr[1]) << 8) |
+                         (static_cast<uint32_t>(hdr[2]) << 16) |
+                         (static_cast<uint32_t>(hdr[3]) << 24);
+        uint32_t hash = static_cast<uint32_t>(hdr[4]) |
+                        (static_cast<uint32_t>(hdr[5]) << 8) |
+                        (static_cast<uint32_t>(hdr[6]) << 16) |
+                        (static_cast<uint32_t>(hdr[7]) << 24);
+        uint32_t snapLen = static_cast<uint32_t>(hdr[8]) |
+                           (static_cast<uint32_t>(hdr[9]) << 8) |
+                           (static_cast<uint32_t>(hdr[10]) << 16) |
+                           (static_cast<uint32_t>(hdr[11]) << 24);
+        cpCount = static_cast<uint16_t>(hdr[12] | (hdr[13] << 8));
+        if (magic != MAGIC_ENKU) {
+          return false;
+        }
+        if (wantHash != 0 && hash != wantHash) {
+          return false;
+        }
+        if (snapLen == 0 || snapLen > kMaxUndoSnapLen) {
+          return false;
+        }
+        headerValid = true;
+
+        // Header is good: reclaim heap (mirrors restoreCheckpoint) before
+        // the transient snapshot allocation.
+        display.clearHistory();
+        display.clearChoices();
+        display.setScrollY(0);
+        display.clearFontCache();
+        clearMainProgress();
+        story.resetRunner();
+
+        uint8_t *snapBuf = static_cast<uint8_t *>(malloc(snapLen));
+        if (!snapBuf) {
+          printf("[StorySaveManager] Failed to allocate %u bytes for undo "
+                 "snapshot\n",
+                 (unsigned)snapLen);
+          return false;
+        }
+        bool readOk = (reader.read(snapBuf, snapLen) == snapLen);
+        bool loadOk = false;
+        if (readOk) {
+          loadOk = story.loadSnapshot(snapBuf, snapLen);
+        }
+        free(snapBuf);
+        if (!loadOk) {
+          if (!story.runner()) {
+            story.createFreshRunner();
+          }
+          return false;
+        }
+        if (!deserializeHistory(reader, history, &story)) {
+          return false;
+        }
+        loaded = true;
+        return true;
+      });
+  if (!ok || !loaded) {
+    if (!headerValid) {
+      // Corrupt or stale sidecar: consume so the menu stops offering it.
+      clearUndo(storage);
+    } else if (!story.runner()) {
+      story.createFreshRunner();
+    }
+    return false;
+  }
+
+  for (const auto &l : history) {
+    display.addWrappedLine(l);
+  }
+
+  // Prune checkpoints saved after the undo point (abandoned future).
+  if (cpCount < _checkpoints.size()) {
+    _checkpoints.erase(_checkpoints.begin() + cpCount, _checkpoints.end());
+    _checkpoints.shrink_to_fit();
+  }
+
+  // Single-level slot: consumed on use. The next choice re-arms it.
+  clearUndo(storage);
+  return true;
+}
+
+void StorySaveManager::clearUndo(IStorage *storage) {
+  _hasUndo = false;
+  _undoSnapLen = 0;
+  _undoCpCount = 0;
+  _undoStreamFn = nullptr;
+  _undoHistory.clear();
+  if (storage != nullptr && !_undoFilePath.empty() &&
+      storage->fileExists(_undoFilePath.c_str())) {
+    storage->deleteFile(_undoFilePath.c_str());
   }
 }

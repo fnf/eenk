@@ -1903,6 +1903,166 @@ void test_story_metadata_save_path(void) {
                            saveBufRootFile);
 }
 
+// --- Undo slot (ENKU sidecar) tests ---------------------------------------
+// Scratch files stay under test/story/ (never /.eenk_saves) and are removed.
+
+void test_undo_roundtrip(void) {
+  TestDisplay display;
+  MockInput input;
+  SDLStorage storage;
+  InkEngine engine(display, input, storage);
+
+  ensure_test_story_media();
+  BootManager::setStoryPath("test/story/story.bin");
+  TEST_ASSERT_TRUE(engine.loadStory("test/story/story.bin"));
+  engine.update(); // RUNNING_TEXT -> STORY_ENDED, history populated
+
+  StorySaveManager &mgr = engine.getSaveManager();
+  uint32_t hash = mgr.getStoryHash();
+  mgr.init("test/story/scratch_undo.sav", hash);
+  TEST_ASSERT_EQUAL_STRING("test/story/scratch_undo.sav.undo",
+                           mgr.getUndoFilePath().c_str());
+
+  size_t snapLen = engine.getSnapshotSize();
+  TEST_ASSERT_TRUE(snapLen > 0);
+  mgr.saveUndoStreaming(
+      snapLen, engine.getDisplayManager().getHistory(),
+      [&](IFileWriter &w) -> size_t {
+        return engine.getStoryManager().streamSnapshotTo(w);
+      });
+  TEST_ASSERT_TRUE(mgr.writeUndoFile(storage));
+  TEST_ASSERT_TRUE(mgr.hasUndo());
+
+  std::vector<std::string> beforeTexts;
+  for (const auto &l : engine.getDisplayManager().getHistory()) {
+    beforeTexts.push_back(l.block.getText());
+  }
+  TEST_ASSERT_TRUE(beforeTexts.size() > 0);
+
+  // Mutate: fresh runner + cleared display.
+  engine.getDisplayManager().clearHistory();
+  engine.getDisplayManager().clearChoices();
+  engine.getStoryManager().createFreshRunner();
+  TEST_ASSERT_EQUAL(0, (int)engine.getDisplayManager().getHistorySize());
+
+  // Restore: history + runner state must match the undo point.
+  TEST_ASSERT_TRUE(mgr.restoreUndo(engine.getStoryManager(),
+                                   engine.getDisplayManager(), &storage));
+  TEST_ASSERT_FALSE(mgr.hasUndo()); // single-level slot is consumed
+  const auto &after = engine.getDisplayManager().getHistory();
+  TEST_ASSERT_TRUE(beforeTexts.size() == after.size());
+  for (size_t i = 0; i < beforeTexts.size(); ++i) {
+    TEST_ASSERT_EQUAL_STRING(beforeTexts[i].c_str(),
+                             after[i].block.getText().c_str());
+  }
+  // Test story ends without choices: runner must be back at the end state.
+  TEST_ASSERT_FALSE(engine.getStoryManager().runner()->can_continue());
+  TEST_ASSERT_FALSE(engine.getStoryManager().runner()->has_choices());
+  TEST_ASSERT_FALSE(
+      storage.fileExists("test/story/scratch_undo.sav.undo"));
+
+  remove("test/story/scratch_undo.sav.undo");
+  remove("test/story/scratch_undo.sav.undo.tmp");
+}
+
+void test_undo_hash_mismatch(void) {
+  TestDisplay display;
+  MockInput input;
+  SDLStorage storage;
+  InkEngine engine(display, input, storage);
+
+  ensure_test_story_media();
+  BootManager::setStoryPath("test/story/story.bin");
+  TEST_ASSERT_TRUE(engine.loadStory("test/story/story.bin"));
+  engine.update();
+
+  StorySaveManager &mgr = engine.getSaveManager();
+  mgr.init("test/story/scratch_undo2.sav", 0xAAAABBBB);
+  size_t snapLen = engine.getSnapshotSize();
+  mgr.saveUndoStreaming(
+      snapLen, engine.getDisplayManager().getHistory(),
+      [&](IFileWriter &w) -> size_t {
+        return engine.getStoryManager().streamSnapshotTo(w);
+      });
+  TEST_ASSERT_TRUE(mgr.writeUndoFile(storage));
+  TEST_ASSERT_TRUE(mgr.hasUndo());
+
+  // Same path, different story version: stale sidecar must be dropped.
+  mgr.init("test/story/scratch_undo2.sav", 0xCCCCDDDD);
+  mgr.loadSaveFile(storage, nullptr); // no .sav, but probes undo
+  TEST_ASSERT_FALSE(mgr.hasUndo());
+  TEST_ASSERT_FALSE(
+      storage.fileExists("test/story/scratch_undo2.sav.undo"));
+
+  remove("test/story/scratch_undo2.sav.undo");
+  remove("test/story/scratch_undo2.sav.undo.tmp");
+}
+
+void test_undo_corrupt_file(void) {
+  SDLStorage storage;
+  const char *undoPath = "test/story/scratch_undo3.sav.undo";
+  FILE *f = fopen(undoPath, "wb");
+  TEST_ASSERT_NOT_NULL(f);
+  fwrite("GARBAGE-DATA-HERE!!", 1, 18, f);
+  fclose(f);
+
+  StorySaveManager mgr;
+  mgr.init("test/story/scratch_undo3.sav", 0x12345678);
+  mgr.loadSaveFile(storage, nullptr);
+  TEST_ASSERT_FALSE(mgr.hasUndo());
+  TEST_ASSERT_FALSE(storage.fileExists(undoPath));
+
+  remove(undoPath);
+  remove("test/story/scratch_undo3.sav.undo.tmp");
+}
+
+void test_undo_truncates_checkpoints(void) {
+  TestDisplay display;
+  MockInput input;
+  SDLStorage storage;
+  InkEngine engine(display, input, storage);
+
+  ensure_test_story_media();
+  BootManager::setStoryPath("test/story/story.bin");
+  TEST_ASSERT_TRUE(engine.loadStory("test/story/story.bin"));
+  engine.update();
+
+  StorySaveManager &mgr = engine.getSaveManager();
+  mgr.init("test/story/scratch_undo4.sav", mgr.getStoryHash());
+  const auto &hist = engine.getDisplayManager().getHistory();
+
+  size_t len = 0;
+  const unsigned char *snap = engine.createSnapshot(&len);
+  TEST_ASSERT_NOT_NULL(snap);
+  TEST_ASSERT_TRUE(len > 0);
+  mgr.saveCheckpoint("Chapter One", snap, len, hist);
+
+  // Undo captures cpCount=1 here.
+  size_t snapLen = engine.getSnapshotSize();
+  mgr.saveUndoStreaming(
+      snapLen, hist, [&](IFileWriter &w) -> size_t {
+        return engine.getStoryManager().streamSnapshotTo(w);
+      });
+  TEST_ASSERT_TRUE(mgr.writeUndoFile(storage));
+  engine.freeSnapshot();
+
+  // Checkpoint from the "abandoned future".
+  snap = engine.createSnapshot(&len);
+  TEST_ASSERT_NOT_NULL(snap);
+  mgr.saveCheckpoint("Chapter Two", snap, len, hist);
+  engine.freeSnapshot();
+  TEST_ASSERT_EQUAL(2, (int)mgr.getCheckpoints().size());
+
+  TEST_ASSERT_TRUE(mgr.restoreUndo(engine.getStoryManager(),
+                                   engine.getDisplayManager(), &storage));
+  TEST_ASSERT_EQUAL(1, (int)mgr.getCheckpoints().size());
+  TEST_ASSERT_EQUAL_STRING("Chapter One",
+                           mgr.getCheckpoints()[0].title.c_str());
+
+  remove("test/story/scratch_undo4.sav.undo");
+  remove("test/story/scratch_undo4.sav.undo.tmp");
+}
+
 void test_rich_text_parser(void) {
   auto runs =
       InkRichTextParser::parse("Line 1<br>Line 2<br/>Line 3<br /><b>Bold</b> "
@@ -3542,6 +3702,10 @@ int main(int argc, char **argv) {
   RUN_TEST(test_choice_reveal_interaction);
   RUN_TEST(test_choice_activation_skips_blink_when_touch_disabled);
   RUN_TEST(test_story_metadata_save_path);
+  RUN_TEST(test_undo_roundtrip);
+  RUN_TEST(test_undo_hash_mismatch);
+  RUN_TEST(test_undo_corrupt_file);
+  RUN_TEST(test_undo_truncates_checkpoints);
   RUN_TEST(test_quick_menu_screenshot);
   RUN_TEST(test_quick_menu_disabled_choices_screenshot);
   // StreamingEpdFontFamily unit tests

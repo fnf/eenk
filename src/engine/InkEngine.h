@@ -38,6 +38,10 @@ public:
 
     static bool parseCheckpointTag(const char* rawTag, std::string& outTitle);
     void triggerCheckpoint(const std::string& checkpointTitle);
+    // Persists the current pre-choice state to the undo slot (sidecar file).
+    // Called on every choice confirm, before the choice is applied. Always
+    // non-fatal: failures are logged and gameplay continues without undo.
+    void saveUndoPoint();
     void handleRuntimeError(const char* errorMsg);
 
     void update();
