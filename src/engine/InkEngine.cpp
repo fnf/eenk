@@ -227,8 +227,9 @@ void InkEngine::saveUndoPoint() {
   if (!_storyManager.runner()) {
     return;
   }
-  // Free cached glyphs first: streamSnapshotTo needs small transient buffers
-  // (~10-15KB for large gamebooks) and the glyph cache fragments the heap.
+  // Free cached glyphs first: snapshot streaming needs small transient
+  // buffers (~2KB max after piecewise chunking) and the glyph cache
+  // fragments the heap.
   _displayManager.clearFontCache();
 
   size_t snapLen = _storyManager.computeSnapshotSize();
@@ -236,7 +237,9 @@ void InkEngine::saveUndoPoint() {
     return;
   }
 
-  _saveManager.saveUndoStreaming(
+  // Zero-copy: borrow display history (no ~30KB deque duplication).
+  // Display stays alive through writeUndoFile, so the borrow is safe.
+  _saveManager.saveUndoBorrowed(
       snapLen, _displayManager.getHistory(),
       [this](IFileWriter &w) -> size_t {
         return _storyManager.streamSnapshotTo(w);
@@ -246,6 +249,11 @@ void InkEngine::saveUndoPoint() {
     // Non-fatal by design: the choice still goes through, only the undo
     // slot stays empty (or keeps its previous content).
     printf("[InkEngine] Undo snapshot write failed (non-fatal)\n");
+#ifdef PLATFORM_ESP32
+    printf("[InkEngine] Undo fail heap: free=%u largest=%u\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+#endif
   }
 }
 
@@ -253,31 +261,51 @@ void InkEngine::triggerCheckpoint(const std::string &checkpointTitle) {
   // Clear font cache to maximize contiguous heap before computing and streaming
   _displayManager.clearFontCache();
 
-  size_t snapLen = _storyManager.computeSnapshotSize();
-  if (snapLen == 0) {
-    printf("[InkEngine] Cannot compute snapshot size for checkpoint '%s'\n",
-           checkpointTitle.c_str());
-    SystemUI ui(_display);
-    ui.showMessage("Save Failed", "Memory too low to save progress.\nPlease restart the device soon.");
+  auto attemptSave = [&](bool isRetry) -> bool {
+    size_t snapLen = _storyManager.computeSnapshotSize();
+    if (snapLen == 0) {
+      printf("[InkEngine] Cannot compute snapshot size for checkpoint '%s'%s\n",
+             checkpointTitle.c_str(), isRetry ? " (retry)" : "");
+      return false;
+    }
+    _saveManager.clearMainProgress();
+    // Zero-copy: borrow display history (no deque duplication). Display
+    // stays alive through writeSaveFile, so the borrow is safe.
+    _saveManager.saveCheckpointBorrowed(
+        checkpointTitle, snapLen, _displayManager.getHistory(),
+        [this](IFileWriter &w) -> size_t {
+          return _storyManager.streamSnapshotTo(w);
+        });
+    if (_saveManager.writeSaveFile(_storage)) {
+      printf("[InkEngine] Checkpoint saved to SD: '%s' (%u bytes snapshot)%s\n",
+             checkpointTitle.c_str(), (unsigned)snapLen,
+             isRetry ? " (retry)" : "");
+      return true;
+    }
+    printf("[InkEngine] Checkpoint save failed for '%s'%s\n",
+           checkpointTitle.c_str(), isRetry ? " (retry)" : "");
+    return false;
+  };
+
+  if (attemptSave(false)) {
     return;
   }
-
-  _saveManager.clearMainProgress();
-  _saveManager.saveCheckpointStreaming(
-      checkpointTitle, snapLen, _displayManager.getHistory(),
-      [this](IFileWriter &w) -> size_t {
-        return _storyManager.streamSnapshotTo(w);
-      });
-
-  if (_saveManager.writeSaveFile(_storage)) {
-    printf("[InkEngine] Checkpoint saved to SD: '%s' (%u bytes snapshot)\n",
-           checkpointTitle.c_str(), (unsigned)snapLen);
-  } else {
-    printf("[InkEngine] Checkpoint save failed for '%s' (Low memory or storage error)\n",
-           checkpointTitle.c_str());
-    SystemUI ui(_display);
-    ui.showMessage("Save Failed", "Memory too low to save progress.\nPlease restart the device soon.");
+  // First attempt failed: emergency reclaim (trim old scrollback, drop
+  // glyphs again) then retry once before giving up. trimOldHistory
+  // preserves the current turn fully — only previous-turn lines are
+  // evicted — so story continuity is unaffected.
+#ifdef PLATFORM_ESP32
+  printf("[InkEngine] Checkpoint fail heap: free=%u largest=%u\n",
+         (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+#endif
+  _displayManager.clearFontCache();
+  _displayManager.trimOldHistory(kHistoryTargetLines);
+  if (attemptSave(true)) {
+    return;
   }
+  SystemUI ui(_display);
+  ui.showMessage("Save Failed", "Memory too low to save progress.\nPlease restart the device soon.");
 }
 
 void InkEngine::handleRuntimeError(const char *errorMsg) {

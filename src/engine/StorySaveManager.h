@@ -20,6 +20,11 @@ struct CheckpointEntry {
   const uint8_t *borrowedSnapshot = nullptr; // Non-owning pointer to snapshot payload while writing
   SnapshotStreamFn streamFn = nullptr; // Streaming snapshot callback while writing
   std::deque<WrappedLine> history;
+  // Non-owning history during write (zero-copy save): points at display
+  // history which must stay alive until writeSaveFile completes. Cleared
+  // after write; persisted checkpoints are disk-backed (history empty in RAM,
+  // loaded from SD on restore).
+  const std::deque<WrappedLine> *borrowedHistory = nullptr;
 
   // On-disk location in save file when snapshotData is empty
   size_t fileOffset = 0;
@@ -81,6 +86,13 @@ public:
   void saveCheckpointStreaming(const std::string &title, size_t snapLen,
                                const std::deque<WrappedLine> &history,
                                SnapshotStreamFn streamFn);
+  // Zero-copy variant: borrows history (no deque duplication) during the
+  // immediate writeSaveFile. Caller must keep `history` alive until write
+  // completes. After a successful write the entry becomes disk-backed
+  // (no RAM history). Prefer over saveCheckpointStreaming on device.
+  void saveCheckpointBorrowed(const std::string &title, size_t snapLen,
+                              const std::deque<WrappedLine> &history,
+                              SnapshotStreamFn streamFn);
 
   bool hasUnnamedCheckpoint() const;
   int getUnnamedCheckpointIndex() const;
@@ -100,6 +112,11 @@ public:
   void saveUndoStreaming(size_t snapLen,
                           const std::deque<WrappedLine> &history,
                           SnapshotStreamFn streamFn);
+  // Zero-copy variant: borrows history (no deque duplication). Caller must
+  // keep `history` alive until writeUndoFile completes. Prefer on device.
+  void saveUndoBorrowed(size_t snapLen,
+                        const std::deque<WrappedLine> &history,
+                        SnapshotStreamFn streamFn);
   bool writeUndoFile(IStorage &storage);
   bool hasUndo() const { return _hasUndo; }
   const std::string &getUndoFilePath() const { return _undoFilePath; }
@@ -136,6 +153,21 @@ public:
 private:
   bool writeSaveData(class IFileWriter &writer, class IFileReader *oldReader,
                      std::vector<size_t> *outNewOffsets = nullptr);
+  // Skip a serialized history in a reader without allocating (for
+  // disk-backed checkpoint loads). Returns false on truncation.
+  static bool skipHistory(class IFileReader &reader);
+  // Stream-copy a serialized history from oldReader (at historyOffset) to
+  // writer without materializing a deque (for truncation persists).
+  // Returns bytes copied, or 0 on failure (empty history is 2 bytes, so 0
+  // unambiguously means failure).
+  static size_t copyHistoryBytes(class IFileReader &oldReader,
+                                 size_t historyOffset,
+                                 class IFileWriter &writer);
+  // Load a disk-backed checkpoint history on demand (historyOffset =
+  // fileOffset + snapshotLen). Returns false on truncation.
+  static bool loadCheckpointHistoryFromDisk(
+      IStorage &storage, const std::string &savePath, size_t historyOffset,
+      std::deque<WrappedLine> &out, InkStoryManager *storyMgr);
   // Validates undo sidecar header (magic + story hash + sane length) and sets
   // _hasUndo. Deletes stale/corrupt files. Header-only: no snapshot bytes
   // are loaded into RAM.
@@ -162,4 +194,6 @@ private:
   size_t _undoCpCount = 0;
   SnapshotStreamFn _undoStreamFn = nullptr;
   std::deque<WrappedLine> _undoHistory;
+  // Non-owning history for saveUndoBorrowed (zero-copy). Cleared after write.
+  const std::deque<WrappedLine> *_undoHistoryBorrowed = nullptr;
 };

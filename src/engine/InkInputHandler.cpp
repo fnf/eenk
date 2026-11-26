@@ -240,14 +240,17 @@ void InkInputHandler::showStoryMenu(
   Action action = optionActions[choice];
   switch (action) {
   case EXIT_TO_MENU: {
-    // Destructively extract history and clear UI caches to maximize available contiguous
-    // heap before computing snapshot size and streaming to disk. This is safe because
-    // the device is going to sleep/menu immediately after saving.
+    // Memory-prudent order: free the big caches BEFORE serializing history
+    // (serialization itself needs ~20KB for a 300-line history). Choices +
+    // streaming fonts (~30KB tables) are dropped first, old scrollback is
+    // trimmed to target (current turn preserved fully), then the smaller
+    // history is serialized. Safe: going to menu immediately after saving.
+    display.clearChoices();
+    display.unloadStreamingFonts();
+    display.trimOldHistory(kHistoryTargetLines);
     std::vector<uint8_t> serializedHistory;
     StorySaveManager::serializeHistory(display.getHistory(), serializedHistory);
-    display.clearChoices();
     display.clearHistory();
-    display.unloadStreamingFonts();
 
     size_t snapLen = engine.getSnapshotSize();
     bool saved = false;

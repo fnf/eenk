@@ -15,13 +15,20 @@ void StorySaveManager::init(const std::string &saveFilePath,
   _hasMainProgress = false;
   _mainSnapshot.clear();
   _mainHistory.clear();
+  _mainHistorySerialized.clear();
+  _mainHistorySerialized.shrink_to_fit();
+  _borrowedMainSnapshot = nullptr;
+  _borrowedMainSnapLen = 0;
+  _mainStreamFn = nullptr;
   _checkpoints.clear();
+  _checkpoints.shrink_to_fit();
   _undoFilePath = saveFilePath.empty() ? "" : saveFilePath + ".undo";
   _hasUndo = false;
   _undoSnapLen = 0;
   _undoCpCount = 0;
   _undoStreamFn = nullptr;
   _undoHistory.clear();
+  _undoHistoryBorrowed = nullptr;
 }
 
 bool StorySaveManager::serializeHistory(const std::deque<WrappedLine> &history,
@@ -57,6 +64,15 @@ bool StorySaveManager::serializeHistory(const std::deque<WrappedLine> &history,
 
 void StorySaveManager::serializeHistory(const std::deque<WrappedLine> &history,
                                         std::vector<uint8_t> &out) {
+  out.clear();
+  // Reserve once to avoid repeated reallocations + fragmentation during
+  // save (300-line history ~20KB). Estimate 64B/line average.
+  size_t estimate = 2 + history.size() * 64;
+  // Cap the reservation sanity (historySize is uint16 on the wire).
+  if (estimate > 256 * 1024) {
+    estimate = 256 * 1024;
+  }
+  out.reserve(estimate);
   uint16_t historySize = static_cast<uint16_t>(history.size());
   out.push_back(static_cast<uint8_t>(historySize & 0xFF));
   out.push_back(static_cast<uint8_t>((historySize >> 8) & 0xFF));
@@ -188,6 +204,103 @@ bool StorySaveManager::deserializeHistory(IFileReader &reader,
   return true;
 }
 
+bool StorySaveManager::skipHistory(IFileReader &reader) {
+  uint8_t szBuf[2];
+  if (reader.read(szBuf, 2) != 2) {
+    return false;
+  }
+  uint16_t historySize = szBuf[0] | (static_cast<uint16_t>(szBuf[1]) << 8);
+  for (uint16_t i = 0; i < historySize; ++i) {
+    uint8_t lenBuf[2];
+    if (reader.read(lenBuf, 2) != 2) {
+      return false;
+    }
+    uint16_t lineLen = lenBuf[0] | (static_cast<uint16_t>(lenBuf[1]) << 8);
+    size_t next = reader.tell() + lineLen + 1; // text + flags
+    if (next > reader.size()) {
+      return false;
+    }
+    if (!reader.seek(next)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+size_t StorySaveManager::copyHistoryBytes(IFileReader &oldReader,
+                                           size_t historyOffset,
+                                           IFileWriter &writer) {
+  size_t bytesCopied = 0;
+  auto countedWrite = [&](const void *data, size_t len) -> bool {
+    if (!writer.write(data, len)) {
+      return false;
+    }
+    bytesCopied += len;
+    return true;
+  };
+  if (!oldReader.seek(historyOffset)) {
+    return 0;
+  }
+  uint8_t szBuf[2];
+  if (oldReader.read(szBuf, 2) != 2) {
+    return 0;
+  }
+  if (!countedWrite(szBuf, 2)) {
+    return 0;
+  }
+  uint16_t historySize = szBuf[0] | (static_cast<uint16_t>(szBuf[1]) << 8);
+  uint8_t chunk[256];
+  for (uint16_t i = 0; i < historySize; ++i) {
+    uint8_t lenBuf[2];
+    if (oldReader.read(lenBuf, 2) != 2) {
+      return 0;
+    }
+    if (!countedWrite(lenBuf, 2)) {
+      return 0;
+    }
+    uint16_t lineLen = lenBuf[0] | (static_cast<uint16_t>(lenBuf[1]) << 8);
+    size_t remaining = lineLen;
+    while (remaining > 0) {
+      size_t toCopy = remaining > sizeof(chunk) ? sizeof(chunk) : remaining;
+      if (oldReader.read(chunk, toCopy) != toCopy) {
+        return 0;
+      }
+      if (!countedWrite(chunk, toCopy)) {
+        return 0;
+      }
+      remaining -= toCopy;
+    }
+    uint8_t flags = 0;
+    if (oldReader.read(&flags, 1) != 1) {
+      return 0;
+    }
+    if (!countedWrite(&flags, 1)) {
+      return 0;
+    }
+  }
+  return bytesCopied;
+}
+
+bool StorySaveManager::loadCheckpointHistoryFromDisk(
+    IStorage &storage, const std::string &savePath, size_t historyOffset,
+    std::deque<WrappedLine> &out, InkStoryManager *storyMgr) {
+  bool ok = false;
+  storage.readStream(savePath.c_str(), [&](IFileReader &reader) -> bool {
+    if (historyOffset >= reader.size()) {
+      return false;
+    }
+    if (!reader.seek(historyOffset)) {
+      return false;
+    }
+    if (!deserializeHistory(reader, out, storyMgr)) {
+      return false;
+    }
+    ok = true;
+    return true;
+  });
+  return ok;
+}
+
 bool StorySaveManager::loadSaveFile(IStorage &storage,
                                     InkStoryManager *storyMgr) {
   if (_saveFilePath.empty() || !storage.fileExists(_saveFilePath.c_str())) {
@@ -247,6 +360,9 @@ bool StorySaveManager::loadSaveFile(IStorage &storage,
           uint32_t snapSize = 0;
           if (!readU32(snapSize))
             return false;
+          if (snapSize > 8u * 1024u * 1024u) {
+            return false;
+          }
           if (snapSize > 0) {
             _mainSnapshot.resize(snapSize);
             if (reader.read(_mainSnapshot.data(), snapSize) != snapSize)
@@ -266,6 +382,10 @@ bool StorySaveManager::loadSaveFile(IStorage &storage,
             uint32_t snapSize = 0;
             if (!readU32(snapSize))
               return false;
+            // Cap absurd sizes (corrupt file) before allocating.
+            if (snapSize > 8u * 1024u * 1024u) {
+              return false;
+            }
             _mainSnapshot.resize(snapSize);
             if (snapSize > 0) {
               if (reader.read(_mainSnapshot.data(), snapSize) != snapSize)
@@ -286,6 +406,10 @@ bool StorySaveManager::loadSaveFile(IStorage &storage,
                   break;
                 std::string title;
                 if (titleLen > 0) {
+                  // Cap absurd title lengths (corrupt file).
+                  if (titleLen > 512) {
+                    break;
+                  }
                   title.resize(titleLen);
                   if (reader.read(&title[0], titleLen) != titleLen)
                     break;
@@ -294,21 +418,28 @@ bool StorySaveManager::loadSaveFile(IStorage &storage,
                 uint32_t snapLen = 0;
                 if (!readU32(snapLen))
                   break;
+                if (snapLen > 8u * 1024u * 1024u) {
+                  break;
+                }
                 size_t snapOffset = reader.tell();
 
                 // Skip snapshot payload in stream! Avoids allocating snapshot in heap.
                 if (!reader.seek(snapOffset + snapLen))
                   break;
 
-                std::deque<WrappedLine> history;
-                if (!deserializeHistory(reader, history, storyMgr))
+                // Disk-backed histories: skip without allocating a deque.
+                // History lives on SD (offset = snapOffset + snapLen) and is
+                // loaded on demand in restoreCheckpoint. Saves ~30KB baseline
+                // RAM on PSRAM-less devices.
+                (void)storyMgr;
+                if (!skipHistory(reader))
                   break;
 
                 CheckpointEntry cp;
                 cp.title = std::move(title);
                 cp.fileOffset = snapOffset;
                 cp.snapshotLen = snapLen;
-                cp.history = std::move(history);
+                // cp.history stays empty (disk-backed).
                 _checkpoints.push_back(std::move(cp));
               }
             }
@@ -455,8 +586,19 @@ bool StorySaveManager::writeSaveData(IFileWriter &writer,
           return false;
         remaining -= toRead;
       }
+    } else if (snapLen > 0) {
+      // No payload source for a non-empty snapshot — broken entry from a
+      // failed previous save. Fail rather than writing corrupt offsets
+      // (header would claim snapLen bytes but 0 would follow).
+      printf("[StorySaveManager] Missing snapshot payload for checkpoint "
+             "'%s' (%u bytes claimed)\n",
+             cp.title.c_str(), (unsigned)snapLen);
+      return false;
     }
 
+    // Capture old offset before assigning the new one (needed for
+    // disk-backed history copy below when outNewOffsets is null).
+    size_t oldFileOffset = cp.fileOffset;
     if (outNewOffsets) {
       outNewOffsets->push_back(newOffset);
     } else {
@@ -464,23 +606,47 @@ bool StorySaveManager::writeSaveData(IFileWriter &writer,
     }
     cp.snapshotLen = snapLen;
 
-    uint16_t cpHistSize = static_cast<uint16_t>(cp.history.size());
-    if (!writeU16(cpHistSize))
-      return false;
-    for (const auto &line : cp.history) {
-      std::string text = line.block.getText();
-      if (line.isImage) {
-        text = "\x1B[IMG:" + line.imagePath + "]";
-      }
-      uint16_t len = static_cast<uint16_t>(text.length());
-      if (!writeU16(len))
+    // History source (in priority order):
+    // 1. borrowedHistory (new zero-copy checkpoint, no RAM duplication)
+    // 2. cp.history (RAM: tests, legacy, or unsaved entry)
+    // 3. disk copy from old file (persisted checkpoint, truncation rewrite)
+    // 4. empty (named milestone with no history)
+    const std::deque<WrappedLine> *histSrc = nullptr;
+    if (cp.borrowedHistory != nullptr) {
+      histSrc = cp.borrowedHistory;
+    } else if (!cp.history.empty()) {
+      histSrc = &cp.history;
+    }
+    if (histSrc != nullptr) {
+      uint16_t cpHistSize = static_cast<uint16_t>(histSrc->size());
+      if (!writeU16(cpHistSize))
         return false;
-      if (len > 0) {
-        if (!writeData(text.data(), len))
+      for (const auto &line : *histSrc) {
+        std::string text = line.block.getText();
+        if (line.isImage) {
+          text = "\x1B[IMG:" + line.imagePath + "]";
+        }
+        uint16_t len = static_cast<uint16_t>(text.length());
+        if (!writeU16(len))
+          return false;
+        if (len > 0) {
+          if (!writeData(text.data(), len))
+            return false;
+        }
+        uint8_t flags = (line.isOld ? 1 : 0) | (line.endOfParagraph ? 2 : 0);
+        if (!writeU8(flags))
           return false;
       }
-      uint8_t flags = (line.isOld ? 1 : 0) | (line.endOfParagraph ? 2 : 0);
-      if (!writeU8(flags))
+    } else if (oldReader && oldFileOffset > 0) {
+      // Disk-backed: historyOffset in the OLD file.
+      size_t oldHistOffset = oldFileOffset + snapLen;
+      size_t copied = copyHistoryBytes(*oldReader, oldHistOffset, writer);
+      if (copied == 0) {
+        return false;
+      }
+      currentOffset += copied;
+    } else {
+      if (!writeU16(0))
         return false;
     }
   }
@@ -494,7 +660,13 @@ bool StorySaveManager::writeSaveFile(IStorage &storage) {
 
   bool hasDiskCheckpoints = false;
   for (const auto &cp : _checkpoints) {
-    if (cp.snapshotData.empty() && cp.fileOffset > 0 && cp.snapshotLen > 0) {
+    // Disk-backed = no new snapshot payload (stream/borrowed/data all empty)
+    // but a valid on-disk location. Borrowed histories alone don't force the
+    // slow path (they are RAM, written directly).
+    bool hasNewSnapshot =
+        (cp.streamFn != nullptr) || (cp.borrowedSnapshot != nullptr) ||
+        !cp.snapshotData.empty();
+    if (!hasNewSnapshot && cp.fileOffset > 0 && cp.snapshotLen > 0) {
       hasDiskCheckpoints = true;
       break;
     }
@@ -517,6 +689,20 @@ bool StorySaveManager::writeSaveFile(IStorage &storage) {
       storage.deleteFile(tmpPath.c_str());
       for (auto &cp : _checkpoints) {
         cp.streamFn = nullptr;
+        cp.borrowedHistory = nullptr;
+      }
+      // Prune broken entries (failed new saves with no payload and no file)
+      // so a later write cannot emit corrupt offsets.
+      for (auto it = _checkpoints.begin(); it != _checkpoints.end();) {
+        bool hasPayload = (it->streamFn != nullptr) ||
+                          (it->borrowedSnapshot != nullptr) ||
+                          !it->snapshotData.empty();
+        bool hasFile = (it->fileOffset > 0 && it->snapshotLen > 0);
+        if (!hasPayload && !hasFile && it->snapshotLen > 0) {
+          it = _checkpoints.erase(it);
+        } else {
+          ++it;
+        }
       }
       _mainStreamFn = nullptr;
       return false;
@@ -526,6 +712,18 @@ bool StorySaveManager::writeSaveFile(IStorage &storage) {
     if (!storage.renameFile(tmpPath.c_str(), _saveFilePath.c_str())) {
       for (auto &cp : _checkpoints) {
         cp.streamFn = nullptr;
+        cp.borrowedHistory = nullptr;
+      }
+      for (auto it = _checkpoints.begin(); it != _checkpoints.end();) {
+        bool hasPayload = (it->streamFn != nullptr) ||
+                          (it->borrowedSnapshot != nullptr) ||
+                          !it->snapshotData.empty();
+        bool hasFile = (it->fileOffset > 0 && it->snapshotLen > 0);
+        if (!hasPayload && !hasFile && it->snapshotLen > 0) {
+          it = _checkpoints.erase(it);
+        } else {
+          ++it;
+        }
       }
       _mainStreamFn = nullptr;
       return false;
@@ -539,6 +737,11 @@ bool StorySaveManager::writeSaveFile(IStorage &storage) {
       _checkpoints[i].streamFn = nullptr;
       _checkpoints[i].snapshotData.clear();
       _checkpoints[i].snapshotData.shrink_to_fit();
+      // Disk-backed from here on: drop RAM histories (frees ~30KB).
+      // Restores load histories from SD on demand.
+      _checkpoints[i].borrowedHistory = nullptr;
+      _checkpoints[i].history.clear();
+      _checkpoints[i].history.shrink_to_fit();
     }
     _borrowedMainSnapshot = nullptr;
     _borrowedMainSnapLen = 0;
@@ -556,8 +759,30 @@ bool StorySaveManager::writeSaveFile(IStorage &storage) {
     }
     _checkpoints[i].borrowedSnapshot = nullptr;
     _checkpoints[i].streamFn = nullptr;
-    _checkpoints[i].snapshotData.clear();
-    _checkpoints[i].snapshotData.shrink_to_fit();
+    // Always drop the transient borrow. Snapshot bytes + RAM histories are
+    // dropped only on success (disk-backed); on failure they are kept for
+    // retry.
+    _checkpoints[i].borrowedHistory = nullptr;
+    if (ok) {
+      _checkpoints[i].snapshotData.clear();
+      _checkpoints[i].snapshotData.shrink_to_fit();
+      _checkpoints[i].history.clear();
+      _checkpoints[i].history.shrink_to_fit();
+    }
+  }
+  if (!ok) {
+    // Prune broken entries (failed new saves with no payload and no file).
+    for (auto it = _checkpoints.begin(); it != _checkpoints.end();) {
+      bool hasPayload = (it->streamFn != nullptr) ||
+                        (it->borrowedSnapshot != nullptr) ||
+                        !it->snapshotData.empty();
+      bool hasFile = (it->fileOffset > 0 && it->snapshotLen > 0);
+      if (!hasPayload && !hasFile && it->snapshotLen > 0) {
+        it = _checkpoints.erase(it);
+      } else {
+        ++it;
+      }
+    }
   }
   _borrowedMainSnapshot = nullptr;
   _borrowedMainSnapLen = 0;
@@ -633,6 +858,9 @@ void StorySaveManager::clearMainProgress() {
   _mainSnapshot.clear();
   _mainSnapshot.shrink_to_fit();
   _mainHistory.clear();
+  _mainHistory.shrink_to_fit();
+  _mainHistorySerialized.clear();
+  _mainHistorySerialized.shrink_to_fit();
 }
 
 bool StorySaveManager::restoreMainProgress(InkStoryManager &story,
@@ -729,6 +957,29 @@ void StorySaveManager::saveCheckpointStreaming(
   _checkpoints.push_back(std::move(cp));
 }
 
+void StorySaveManager::saveCheckpointBorrowed(
+    const std::string &title, size_t snapLen,
+    const std::deque<WrappedLine> &history, SnapshotStreamFn streamFn) {
+  if (snapLen == 0 || !streamFn)
+    return;
+  for (auto it = _checkpoints.begin(); it != _checkpoints.end(); ++it) {
+    if (it->title == title) {
+      _checkpoints.erase(it);
+      break;
+    }
+  }
+  CheckpointEntry cp;
+  cp.title = title;
+  cp.snapshotLen = snapLen;
+  cp.streamFn = std::move(streamFn);
+  // Zero-copy: borrow display history (no deque duplication). Named
+  // milestones keep no history at all.
+  if (title.empty()) {
+    cp.borrowedHistory = &history;
+  }
+  _checkpoints.push_back(std::move(cp));
+}
+
 bool StorySaveManager::hasUnnamedCheckpoint() const {
   return getUnnamedCheckpointIndex() >= 0;
 }
@@ -766,7 +1017,18 @@ bool StorySaveManager::restoreCheckpoint(size_t index, InkStoryManager &story,
   if (index >= _checkpoints.size())
     return false;
 
-  const auto &cp = _checkpoints[index];
+  // Capture disk location + RAM history presence before reclaim (display
+  // clear does not touch _checkpoints, but be explicit).
+  size_t cpFileOffset = _checkpoints[index].fileOffset;
+  size_t cpSnapLen = _checkpoints[index].snapshotLen;
+  bool hasRamHistory = !_checkpoints[index].history.empty();
+  const std::deque<WrappedLine> *borrowedHist =
+      _checkpoints[index].borrowedHistory;
+  bool hasInMemSnapshot = !_checkpoints[index].snapshotData.empty();
+  const uint8_t *memSnapData =
+      hasInMemSnapshot ? _checkpoints[index].snapshotData.data() : nullptr;
+  size_t memSnapLen =
+      hasInMemSnapshot ? _checkpoints[index].snapshotData.size() : 0;
 
   // 1. Reclaim heap memory from active display history, choices, mid-chapter progress,
   //    and the current runner/globals before attempting to allocate snapshot buffers.
@@ -777,30 +1039,33 @@ bool StorySaveManager::restoreCheckpoint(size_t index, InkStoryManager &story,
   clearMainProgress();
   story.resetRunner();
 
-  if (!cp.snapshotData.empty()) {
-    if (!story.loadSnapshot(cp.snapshotData.data(), cp.snapshotData.size())) {
+  if (hasInMemSnapshot) {
+    if (!story.loadSnapshot(memSnapData, memSnapLen)) {
       if (!story.runner()) {
         story.createFreshRunner();
       }
       return false;
     }
-  } else if (cp.fileOffset > 0 && cp.snapshotLen > 0 && storage) {
+  } else if (cpFileOffset > 0 && cpSnapLen > 0 && storage) {
     bool loaded = false;
     storage->readStream(
         _saveFilePath.c_str(), [&](IFileReader &reader) -> bool {
-          if (!reader.seek(cp.fileOffset))
+          if (!reader.seek(cpFileOffset))
             return false;
-          uint8_t *snapBuf = (uint8_t *)malloc(cp.snapshotLen);
-          if (!snapBuf) {
-            printf("[StorySaveManager] Failed to allocate %u bytes for checkpoint snapshot\n",
-                   (unsigned)cp.snapshotLen);
+          if (cpSnapLen > 8u * 1024u * 1024u) {
             return false;
           }
-          if (reader.read(snapBuf, cp.snapshotLen) != cp.snapshotLen) {
+          uint8_t *snapBuf = (uint8_t *)malloc(cpSnapLen);
+          if (!snapBuf) {
+            printf("[StorySaveManager] Failed to allocate %u bytes for checkpoint snapshot\n",
+                   (unsigned)cpSnapLen);
+            return false;
+          }
+          if (reader.read(snapBuf, cpSnapLen) != cpSnapLen) {
             free(snapBuf);
             return false;
           }
-          bool ok = story.loadSnapshot(snapBuf, cp.snapshotLen);
+          bool ok = story.loadSnapshot(snapBuf, cpSnapLen);
           free(snapBuf);
           if (!ok) {
             if (!story.runner()) {
@@ -824,9 +1089,33 @@ bool StorySaveManager::restoreCheckpoint(size_t index, InkStoryManager &story,
     return false;
   }
 
-  for (const auto &l : cp.history) {
-    display.addWrappedLine(l);
+  // 2. History: RAM first (tests / unsaved), else borrowed (mid-write,
+  // defensive), else disk-backed on demand (normal device path).
+  if (hasRamHistory) {
+    for (const auto &l : _checkpoints[index].history) {
+      display.addWrappedLine(l);
+    }
+  } else if (borrowedHist != nullptr) {
+    for (const auto &l : *borrowedHist) {
+      display.addWrappedLine(l);
+    }
+  } else if (cpFileOffset > 0 && cpSnapLen > 0 && storage) {
+    std::deque<WrappedLine> diskHist;
+    size_t histOffset = cpFileOffset + cpSnapLen;
+    if (loadCheckpointHistoryFromDisk(*storage, _saveFilePath, histOffset,
+                                      diskHist, &story)) {
+      for (const auto &l : diskHist) {
+        display.addWrappedLine(l);
+      }
+    } else {
+      // Disk history unreadable (truncated file): continue with empty
+      // history rather than failing the rewind. Snapshot already loaded.
+      printf("[StorySaveManager] Checkpoint history load failed, "
+             "continuing with empty history\n");
+    }
   }
+  // else: named milestone with no history — display stays empty, story
+  // continues from the snapshot. Existing behavior.
 
   // Pruning: delete all checkpoint entries chronologically after index
   if (index + 1 < _checkpoints.size()) {
@@ -840,8 +1129,16 @@ bool StorySaveManager::restoreCheckpoint(size_t index, InkStoryManager &story,
 void StorySaveManager::clearAll(IStorage &storage) {
   _hasMainProgress = false;
   _mainSnapshot.clear();
+  _mainSnapshot.shrink_to_fit();
   _mainHistory.clear();
+  _mainHistory.shrink_to_fit();
+  _mainHistorySerialized.clear();
+  _mainHistorySerialized.shrink_to_fit();
+  _borrowedMainSnapshot = nullptr;
+  _borrowedMainSnapLen = 0;
+  _mainStreamFn = nullptr;
   _checkpoints.clear();
+  _checkpoints.shrink_to_fit();
   if (!_saveFilePath.empty() && storage.fileExists(_saveFilePath.c_str())) {
     storage.deleteFile(_saveFilePath.c_str());
   }
@@ -860,7 +1157,23 @@ void StorySaveManager::saveUndoStreaming(
   // abandoned future and are truncated on restore.
   _undoCpCount = _checkpoints.size() > 0xFFFF ? 0xFFFF : _checkpoints.size();
   _undoStreamFn = std::move(streamFn);
+  _undoHistoryBorrowed = nullptr;
   _undoHistory = history;
+}
+
+void StorySaveManager::saveUndoBorrowed(
+    size_t snapLen, const std::deque<WrappedLine> &history,
+    SnapshotStreamFn streamFn) {
+  if (snapLen == 0 || snapLen > kMaxUndoSnapLen || !streamFn ||
+      _undoFilePath.empty()) {
+    return;
+  }
+  _undoSnapLen = snapLen;
+  _undoCpCount = _checkpoints.size() > 0xFFFF ? 0xFFFF : _checkpoints.size();
+  _undoStreamFn = std::move(streamFn);
+  // Zero-copy: no deque duplication (~30KB saved during every choice).
+  _undoHistory.clear();
+  _undoHistoryBorrowed = &history;
 }
 
 bool StorySaveManager::writeUndoFile(IStorage &storage) {
@@ -871,6 +1184,10 @@ bool StorySaveManager::writeUndoFile(IStorage &storage) {
     size_t snapLen = _undoSnapLen;
     uint16_t cpCount = static_cast<uint16_t>(_undoCpCount);
     uint32_t storyHash = _storyHash;
+    // Resolve history source: borrowed (device, zero-copy) else RAM copy
+    // (tests / legacy). Borrowed must stay alive through this call.
+    const std::deque<WrappedLine> *histSrc =
+        _undoHistoryBorrowed != nullptr ? _undoHistoryBorrowed : &_undoHistory;
     ok = storage.writeStream(
         tmpPath.c_str(), [&](IFileWriter &writer) -> bool {
           uint8_t hdr[16];
@@ -894,7 +1211,7 @@ bool StorySaveManager::writeUndoFile(IStorage &storage) {
             return false;
           if (_undoStreamFn(writer) != snapLen)
             return false;
-          return serializeHistory(_undoHistory, writer);
+          return serializeHistory(*histSrc, writer);
         });
     if (ok) {
       storage.deleteFile(_undoFilePath.c_str());
@@ -912,6 +1229,7 @@ bool StorySaveManager::writeUndoFile(IStorage &storage) {
   _undoSnapLen = 0;
   _undoCpCount = 0;
   _undoHistory.clear();
+  _undoHistoryBorrowed = nullptr;
   if (ok) {
     _hasUndo = true;
   }
@@ -1083,6 +1401,8 @@ void StorySaveManager::clearUndo(IStorage *storage) {
   _undoCpCount = 0;
   _undoStreamFn = nullptr;
   _undoHistory.clear();
+  _undoHistory.shrink_to_fit();
+  _undoHistoryBorrowed = nullptr;
   if (storage != nullptr && !_undoFilePath.empty() &&
       storage->fileExists(_undoFilePath.c_str())) {
     storage->deleteFile(_undoFilePath.c_str());

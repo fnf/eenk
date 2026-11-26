@@ -575,15 +575,17 @@ void saveProgress() {
   systemUI->showLoading("Saving Progress...", 1.0f);
   delay(100);
 
-  std::vector<uint8_t> serializedHistory;
-  StorySaveManager::serializeHistory(engine->getHistory(), serializedHistory);
+  // Memory-prudent order: free big caches BEFORE serializing history.
   // Fully destroy streaming fonts to remove heap fragmentation barriers.
   // The glyph metadata tables (~10KB per variant) sit in the middle of the heap
   // and prevent freed memory from coalescing into a contiguous block.
   engine->getDisplayManager().clearChoices();
-  engine->getDisplayManager().clearHistory();
   engine->getDisplayManager().unloadStreamingFonts();
-  
+  engine->getDisplayManager().trimOldHistory(kHistoryTargetLines);
+  std::vector<uint8_t> serializedHistory;
+  StorySaveManager::serializeHistory(engine->getHistory(), serializedHistory);
+  engine->getDisplayManager().clearHistory();
+
   size_t snapLen = engine->getSnapshotSize();
   if (snapLen > 0) {
     engine->getSaveManager().saveMainProgressStreaming(

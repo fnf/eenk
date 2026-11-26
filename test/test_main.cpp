@@ -2063,6 +2063,173 @@ void test_undo_truncates_checkpoints(void) {
   remove("test/story/scratch_undo4.sav.undo.tmp");
 }
 
+// --- Memory-prudent save path tests ---------------------------------------
+// Borrowed (zero-copy) saves + disk-backed checkpoint histories.
+
+void test_checkpoint_borrowed_disk_backed(void) {
+  TestDisplay display;
+  MockInput input;
+  SDLStorage storage;
+  InkEngine engine(display, input, storage);
+
+  ensure_test_story_media();
+  BootManager::setStoryPath("test/story/story.bin");
+  TEST_ASSERT_TRUE(engine.loadStory("test/story/story.bin"));
+  engine.update(); // populate history
+
+  const char *savePath = "test/story/scratch_borrowed.sav";
+  storage.deleteFile(savePath);
+  StorySaveManager &mgr = engine.getSaveManager();
+  mgr.init(savePath, mgr.getStoryHash());
+
+  std::vector<std::string> beforeTexts;
+  for (const auto &l : engine.getDisplayManager().getHistory()) {
+    beforeTexts.push_back(l.block.getText());
+  }
+  TEST_ASSERT_TRUE(beforeTexts.size() > 0);
+
+  size_t snapLen = engine.getSnapshotSize();
+  TEST_ASSERT_TRUE(snapLen > 0);
+  // Borrowed: no deque duplication during save.
+  mgr.saveCheckpointBorrowed(
+      "", snapLen, engine.getDisplayManager().getHistory(),
+      [&](IFileWriter &w) -> size_t {
+        return engine.getStoryManager().streamSnapshotTo(w);
+      });
+  TEST_ASSERT_TRUE(mgr.writeSaveFile(storage));
+  // After a successful write the entry is disk-backed (no RAM history).
+  TEST_ASSERT_EQUAL(1, (int)mgr.getCheckpoints().size());
+  TEST_ASSERT_TRUE(mgr.getCheckpoints()[0].history.empty());
+  TEST_ASSERT_TRUE(mgr.getCheckpoints()[0].fileOffset > 0);
+
+  // Load into a fresh manager: histories stay on disk (no RAM alloc).
+  StorySaveManager mgr2;
+  mgr2.init(savePath, mgr.getStoryHash());
+  TEST_ASSERT_TRUE(mgr2.loadSaveFile(storage, nullptr));
+  TEST_ASSERT_EQUAL(1, (int)mgr2.getCheckpoints().size());
+  TEST_ASSERT_TRUE(mgr2.getCheckpoints()[0].history.empty());
+
+  // Restore loads history from disk on demand.
+  InkStoryManager story2(storage);
+  StoryMetadata meta;
+  std::string base, dir;
+  TEST_ASSERT_TRUE(story2.loadStory("test/story/story.bin", meta, base, dir));
+  TestDisplay disp2;
+  InkDisplayManager idm2(disp2);
+  TEST_ASSERT_TRUE(mgr2.restoreCheckpoint(0, story2, idm2, &storage));
+  const auto &after = idm2.getHistory();
+  TEST_ASSERT_TRUE(beforeTexts.size() == after.size());
+  for (size_t i = 0; i < beforeTexts.size(); ++i) {
+    TEST_ASSERT_EQUAL_STRING(beforeTexts[i].c_str(),
+                             after[i].block.getText().c_str());
+  }
+  storage.deleteFile(savePath);
+  storage.deleteFile("test/story/scratch_borrowed.sav.tmp");
+}
+
+void test_undo_borrowed_roundtrip(void) {
+  TestDisplay display;
+  MockInput input;
+  SDLStorage storage;
+  InkEngine engine(display, input, storage);
+
+  ensure_test_story_media();
+  BootManager::setStoryPath("test/story/story.bin");
+  TEST_ASSERT_TRUE(engine.loadStory("test/story/story.bin"));
+  engine.update();
+
+  StorySaveManager &mgr = engine.getSaveManager();
+  mgr.init("test/story/scratch_undo_b.sav", mgr.getStoryHash());
+
+  std::vector<std::string> beforeTexts;
+  for (const auto &l : engine.getDisplayManager().getHistory()) {
+    beforeTexts.push_back(l.block.getText());
+  }
+  TEST_ASSERT_TRUE(beforeTexts.size() > 0);
+
+  size_t snapLen = engine.getSnapshotSize();
+  mgr.saveUndoBorrowed(
+      snapLen, engine.getDisplayManager().getHistory(),
+      [&](IFileWriter &w) -> size_t {
+        return engine.getStoryManager().streamSnapshotTo(w);
+      });
+  TEST_ASSERT_TRUE(mgr.writeUndoFile(storage));
+  TEST_ASSERT_TRUE(mgr.hasUndo());
+
+  engine.getDisplayManager().clearHistory();
+  engine.getStoryManager().createFreshRunner();
+  TEST_ASSERT_TRUE(mgr.restoreUndo(engine.getStoryManager(),
+                                   engine.getDisplayManager(), &storage));
+  const auto &after = engine.getDisplayManager().getHistory();
+  TEST_ASSERT_TRUE(beforeTexts.size() == after.size());
+  for (size_t i = 0; i < beforeTexts.size(); ++i) {
+    TEST_ASSERT_EQUAL_STRING(beforeTexts[i].c_str(),
+                             after[i].block.getText().c_str());
+  }
+  remove("test/story/scratch_undo_b.sav.undo");
+  remove("test/story/scratch_undo_b.sav.undo.tmp");
+}
+
+void test_truncation_preserves_disk_history(void) {
+  TestDisplay display;
+  MockInput input;
+  SDLStorage storage;
+  InkEngine engine(display, input, storage);
+
+  ensure_test_story_media();
+  BootManager::setStoryPath("test/story/story.bin");
+  TEST_ASSERT_TRUE(engine.loadStory("test/story/story.bin"));
+  engine.update();
+
+  const char *savePath = "test/story/scratch_trunc.sav";
+  storage.deleteFile(savePath);
+  StorySaveManager &mgr = engine.getSaveManager();
+  mgr.init(savePath, mgr.getStoryHash());
+  const auto &hist = engine.getDisplayManager().getHistory();
+  TEST_ASSERT_TRUE(hist.size() > 0);
+
+  size_t len = 0;
+  const unsigned char *snap = engine.createSnapshot(&len);
+  TEST_ASSERT_NOT_NULL(snap);
+  // Unnamed (with history) + named milestone (no history).
+  mgr.saveCheckpoint("", snap, len, hist);
+  mgr.saveCheckpoint("Chapter 1", snap, len, hist);
+  engine.freeSnapshot();
+  TEST_ASSERT_TRUE(mgr.writeSaveFile(storage));
+
+  // Load fresh (disk-backed), rewind to unnamed (prunes Chapter 1),
+  // persist the truncation — history must survive the rewrite via
+  // stream-copy (no RAM materialization).
+  StorySaveManager mgr2;
+  mgr2.init(savePath, mgr.getStoryHash());
+  TEST_ASSERT_TRUE(mgr2.loadSaveFile(storage, nullptr));
+  TEST_ASSERT_EQUAL(2, (int)mgr2.getCheckpoints().size());
+
+  InkStoryManager story2(storage);
+  StoryMetadata meta;
+  std::string base, dir;
+  TEST_ASSERT_TRUE(story2.loadStory("test/story/story.bin", meta, base, dir));
+  TestDisplay disp2;
+  InkDisplayManager idm2(disp2);
+  TEST_ASSERT_TRUE(mgr2.restoreCheckpoint(0, story2, idm2, &storage));
+  TEST_ASSERT_EQUAL(1, (int)mgr2.getCheckpoints().size());
+  TEST_ASSERT_TRUE(mgr2.writeSaveFile(storage));
+
+  // Reload and verify the unnamed history is intact after truncation.
+  StorySaveManager mgr3;
+  mgr3.init(savePath, mgr.getStoryHash());
+  TEST_ASSERT_TRUE(mgr3.loadSaveFile(storage, nullptr));
+  TEST_ASSERT_EQUAL(1, (int)mgr3.getCheckpoints().size());
+  InkStoryManager story3(storage);
+  TEST_ASSERT_TRUE(story3.loadStory("test/story/story.bin", meta, base, dir));
+  TestDisplay disp3;
+  InkDisplayManager idm3(disp3);
+  TEST_ASSERT_TRUE(mgr3.restoreCheckpoint(0, story3, idm3, &storage));
+  TEST_ASSERT_TRUE(hist.size() == idm3.getHistory().size());
+  storage.deleteFile(savePath);
+  storage.deleteFile("test/story/scratch_trunc.sav.tmp");
+}
+
 void test_rich_text_parser(void) {
   auto runs =
       InkRichTextParser::parse("Line 1<br>Line 2<br/>Line 3<br /><b>Bold</b> "
@@ -3706,6 +3873,9 @@ int main(int argc, char **argv) {
   RUN_TEST(test_undo_hash_mismatch);
   RUN_TEST(test_undo_corrupt_file);
   RUN_TEST(test_undo_truncates_checkpoints);
+  RUN_TEST(test_checkpoint_borrowed_disk_backed);
+  RUN_TEST(test_undo_borrowed_roundtrip);
+  RUN_TEST(test_truncation_preserves_disk_history);
   RUN_TEST(test_quick_menu_screenshot);
   RUN_TEST(test_quick_menu_disabled_choices_screenshot);
   // StreamingEpdFontFamily unit tests
